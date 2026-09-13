@@ -15,7 +15,8 @@ use codex_plus_core::settings::{
 };
 use codex_plus_core::status::{LaunchStatus, StatusStore};
 use codex_plus_core::taskboard_runtime::{
-    TASKBOARD_URL, spawn_taskboard_service, taskboard_health_ok, wait_for_taskboard_health,
+    TASKBOARD_URL, spawn_taskboard_service, taskboard_health_ok, taskboard_launch_warning,
+    wait_for_taskboard_health,
 };
 use codex_plus_core::user_scripts::UserScriptManager;
 use codex_plus_core::zed_remote::{ZedOpenStrategy, ZedRemoteProject};
@@ -1198,7 +1199,10 @@ pub fn ensure_taskboard_service() -> CommandResult<TaskboardPayload> {
     }
 
     if wait_for_taskboard_health(Duration::from_secs(8)) {
-        ok("Taskboard started.", taskboard_payload(false, true))
+        let message = taskboard_launch_warning()
+            .map(|warning| format!("Taskboard started. {warning}"))
+            .unwrap_or_else(|| "Taskboard started.".to_string());
+        ok(&message, taskboard_payload(false, true))
     } else {
         failed(
             "Started codex-taskboard, but http://127.0.0.1:47823/health is still unavailable.",

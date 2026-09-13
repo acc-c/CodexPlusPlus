@@ -310,6 +310,16 @@ mod tests {
         }));
 
         unsafe {
+            std::env::set_var(TASKBOARD_HOST_ENV, LAN_TASKBOARD_HOST);
+            std::env::set_var(TASKBOARD_SHARED_SECRET_ENV, "test-secret");
+        }
+        let lan_command = taskboard_service_command(Some(&root));
+        assert!(lan_command.get_envs().any(|(name, value)| {
+            name == std::ffi::OsStr::new(TASKBOARD_HOST_ENV)
+                && value == Some(std::ffi::OsStr::new(LAN_TASKBOARD_HOST))
+        }));
+
+        unsafe {
             match previous_host {
                 Some(value) => std::env::set_var(TASKBOARD_HOST_ENV, value),
                 None => {
