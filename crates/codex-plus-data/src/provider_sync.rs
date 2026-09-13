@@ -1,3 +1,4 @@
+use fs2::FileExt;
 use rusqlite::{Connection, OptionalExtension, params_from_iter, types::Value as SqlValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -12,6 +13,200 @@ const DEFAULT_PROVIDER: &str = "openai";
 const SESSION_DIRS: [&str; 2] = ["sessions", "archived_sessions"];
 const BACKUP_KEEP_COUNT: usize = 5;
 const REMOTE_CONTROL_CREATION_WINDOW_SECS: i64 = 15 * 60;
+
+/// `create_lock` 先建目录再写 `owner.json`，两步之间被强杀会留下没有 owner 的锁目录。
+/// 该窗口只有几毫秒，因此超过这个时长仍缺 owner 的锁一定是中断残留，可以安全回收；
+/// 反过来说，宽限期内的无主锁必须保留，否则会把正在建锁的同伴进程挤掉。
+const LOCK_INTERRUPTED_GRACE_SECS: u64 = 60;
+/// Legacy owner files do not record the OS process creation time. A live PID whose process began
+/// well after the lock was created is a reused PID, not the original lock owner.
+const LEGACY_PID_REUSE_TOLERANCE_SECS: u64 = 5 * 60;
+const LEGACY_PID_REUSE_MIN_LOCK_AGE_SECS: u64 = 24 * 60 * 60;
+const PROCESS_START_MATCH_TOLERANCE_SECS: u64 = 5;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderSyncLockOwner {
+    pid: u32,
+    started_at: u64,
+    #[serde(default)]
+    process_started_at: Option<u64>,
+    #[serde(default)]
+    process_birth_id: Option<String>,
+    #[serde(default)]
+    lock_id: Option<String>,
+}
+
+/// provider sync 锁的可观测状态。管理器在强杀 launcher 前用它判断
+/// 「现在是不是有人正在同步」，避免把同步中的进程打断（issue #1901）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "state")]
+pub enum ProviderSyncLockState {
+    /// 没有锁，可以安全重启。
+    Free,
+    /// 锁被一个仍在运行的进程持有，同步很可能正在进行中。
+    Held { pid: u32, started_at: u64 },
+    /// 锁存在但持有者已经退出（或 owner 信息缺失且已过宽限期），
+    /// 下一次 `acquire_lock` 会自动回收它。
+    Stale { pid: Option<u32> },
+    /// 锁存在、owner 信息不可读，但仍在宽限期内——无法判断是否有人正在建锁。
+    Indeterminate,
+}
+
+#[derive(Debug)]
+pub struct ProviderSyncLifecycleGuard {
+    lock_dir: PathBuf,
+    lock_file: File,
+    lock_id: String,
+    directory_released: bool,
+    file_unlocked: bool,
+}
+
+impl ProviderSyncLifecycleGuard {
+    /// Releases both compatibility and OS ownership before a caller starts a successor process.
+    /// A mismatched owner is an ABA conflict and must block the successor instead of deleting it.
+    pub fn release(mut self) -> std::io::Result<()> {
+        if !release_owned_lock(&self.lock_dir, &self.lock_id)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "provider-sync lock ownership changed before release",
+            ));
+        }
+        self.directory_released = true;
+        FileExt::unlock(&self.lock_file)?;
+        self.file_unlocked = true;
+        Ok(())
+    }
+}
+
+impl Drop for ProviderSyncLifecycleGuard {
+    fn drop(&mut self) {
+        if !self.directory_released {
+            let _ = release_owned_lock(&self.lock_dir, &self.lock_id);
+        }
+        if !self.file_unlocked {
+            let _ = FileExt::unlock(&self.lock_file);
+        }
+    }
+}
+
+/// Atomically reserves provider-sync lifecycle ownership for a restart or a real sync.
+/// The OS file lock is released automatically if the process exits; the legacy directory remains
+/// present while held so older launchers also stay out of the critical section.
+pub fn try_acquire_provider_sync_lifecycle_guard(
+    codex_home: Option<&Path>,
+) -> std::io::Result<ProviderSyncLifecycleGuard> {
+    let home = codex_home
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_codex_home_dir);
+    acquire_lock_inner(&home.join("tmp/provider-sync.lock"), false)
+}
+
+/// 读取 provider sync 锁的当前状态，不获取也不修改它。
+pub fn inspect_provider_sync_lock(codex_home: Option<&Path>) -> ProviderSyncLockState {
+    let home = codex_home
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_codex_home_dir);
+    inspect_lock(&home.join("tmp/provider-sync.lock"))
+}
+
+fn inspect_lock(path: &Path) -> ProviderSyncLockState {
+    if !path.exists() {
+        return ProviderSyncLockState::Free;
+    }
+    classify_lock(
+        read_lock_owner(path).as_ref(),
+        lock_dir_age_secs(path),
+        codex_plus_core::watcher::inspect_process_instance,
+    )
+}
+
+/// 根据 owner 信息和锁目录年龄判定锁的状态。与文件系统解耦，便于穷举测试。
+fn classify_lock(
+    owner: Option<&ProviderSyncLockOwner>,
+    age_secs: Option<u64>,
+    inspect_process: impl Fn(u32) -> codex_plus_core::watcher::ProcessInstanceState,
+) -> ProviderSyncLockState {
+    let Some(owner) = owner else {
+        // owner.json 缺失或损坏。持有者只在建锁的几毫秒内处于这个状态，
+        // 所以超过宽限期就说明它是被强杀留下的残骸。
+        return if age_secs.is_some_and(|age| age >= LOCK_INTERRUPTED_GRACE_SECS) {
+            ProviderSyncLockState::Stale { pid: None }
+        } else {
+            ProviderSyncLockState::Indeterminate
+        };
+    };
+    use codex_plus_core::watcher::ProcessInstanceState;
+    match inspect_process(owner.pid) {
+        ProcessInstanceState::NotRunning => ProviderSyncLockState::Stale {
+            pid: Some(owner.pid),
+        },
+        ProcessInstanceState::Running {
+            started_at_secs,
+            birth_id: current_birth_id,
+        } => {
+            let birth_mismatch = owner
+                .process_birth_id
+                .as_deref()
+                .zip(current_birth_id.as_deref())
+                .is_some_and(|(expected, current)| expected != current);
+            let recorded_start_mismatch = owner.process_birth_id.is_none()
+                && owner.process_started_at.zip(started_at_secs).is_some_and(
+                    |(expected, current)| {
+                        expected.abs_diff(current) > PROCESS_START_MATCH_TOLERANCE_SECS
+                    },
+                );
+            let legacy_pid_reuse = owner.process_birth_id.is_none()
+                && owner.process_started_at.is_none()
+                && age_secs.is_some_and(|age| age >= LEGACY_PID_REUSE_MIN_LOCK_AGE_SECS)
+                && started_at_secs.is_some_and(|current| {
+                    current
+                        > owner
+                            .started_at
+                            .saturating_add(LEGACY_PID_REUSE_TOLERANCE_SECS)
+                });
+            if birth_mismatch || recorded_start_mismatch || legacy_pid_reuse {
+                ProviderSyncLockState::Stale {
+                    pid: Some(owner.pid),
+                }
+            } else {
+                ProviderSyncLockState::Held {
+                    pid: owner.pid,
+                    started_at: owner.started_at,
+                }
+            }
+        }
+        // Unknown process identity cannot prove that the owner is gone. Preserve the lock.
+        ProcessInstanceState::Unknown => ProviderSyncLockState::Held {
+            pid: owner.pid,
+            started_at: owner.started_at,
+        },
+    }
+}
+
+fn current_process_identity() -> (Option<u64>, Option<String>) {
+    match codex_plus_core::watcher::inspect_process_instance(std::process::id()) {
+        codex_plus_core::watcher::ProcessInstanceState::Running {
+            started_at_secs,
+            birth_id,
+        } => (started_at_secs, birth_id),
+        _ => (None, None),
+    }
+}
+
+fn read_lock_owner(path: &Path) -> Option<ProviderSyncLockOwner> {
+    serde_json::from_slice::<ProviderSyncLockOwner>(&fs::read(path.join("owner.json")).ok()?).ok()
+}
+
+fn lock_dir_age_secs(path: &Path) -> Option<u64> {
+    let created = fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()?;
+    SystemTime::now()
+        .duration_since(created)
+        .ok()
+        .map(|elapsed| elapsed.as_secs())
+}
 
 fn default_codex_home_dir() -> PathBuf {
     codex_plus_core::codex_home::default_codex_home_dir()
@@ -38,8 +233,21 @@ pub struct ProviderSyncResult {
     pub sqlite_user_event_rows_updated: usize,
     pub sqlite_cwd_rows_updated: usize,
     pub sqlite_catalog_rows_inserted: usize,
+    #[serde(default)]
+    pub sqlite_catalog_rows_removed: usize,
     pub updated_workspace_roots: usize,
     pub encrypted_content_warning: Option<String>,
+    #[serde(default)]
+    pub repair_audit: ProviderSyncAudit,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSyncAudit {
+    pub catalog_only_sessions: usize,
+    pub catalog_only_with_current_rollout: usize,
+    pub catalog_only_with_backup_database: usize,
+    pub catalog_only_without_recovery_source: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,6 +334,13 @@ struct SessionChanges {
     changes: Vec<SessionChange>,
     skipped_locked_rollout_files: Vec<PathBuf>,
     encrypted_content_counts: HashMap<String, usize>,
+    subagent_thread_ids: HashSet<String>,
+}
+
+#[derive(Debug, Default)]
+struct ProviderSyncThreadKinds {
+    subagent_thread_ids: HashSet<String>,
+    explicit_user_thread_ids: HashSet<String>,
 }
 
 #[derive(Debug, Default)]
@@ -149,6 +364,7 @@ struct SqliteUpdateCounts {
     user_event_rows: usize,
     cwd_rows: usize,
     catalog_insert_rows: usize,
+    catalog_remove_rows: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -165,6 +381,57 @@ struct CatalogRepairThread {
     thread_source: Option<String>,
 }
 
+#[derive(Debug)]
+struct CatalogRepairObservedThread {
+    thread: CatalogRepairThread,
+    eligible: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct CatalogRepairCounts {
+    inserted_rows: usize,
+    removed_rows: usize,
+}
+
+impl CatalogRepairCounts {
+    fn total(&self) -> usize {
+        self.inserted_rows + self.removed_rows
+    }
+
+    fn add(&mut self, other: Self) {
+        self.inserted_rows += other.inserted_rows;
+        self.removed_rows += other.removed_rows;
+    }
+}
+
+#[derive(Debug, Default)]
+struct CatalogRepairPlan {
+    threads: HashMap<String, CatalogRepairThread>,
+    non_root_thread_ids: HashSet<String>,
+    ineligible_thread_ids: HashSet<String>,
+    catalog_non_root_thread_ids: HashMap<PathBuf, HashSet<String>>,
+}
+
+impl CatalogRepairPlan {
+    fn has_cleanup_candidates(&self) -> bool {
+        !self.non_root_thread_ids.is_empty()
+            || !self.ineligible_thread_ids.is_empty()
+            || self
+                .catalog_non_root_thread_ids
+                .values()
+                .any(|thread_ids| !thread_ids.is_empty())
+    }
+
+    fn cleanup_thread_ids_for_path(&self, path: &Path) -> HashSet<String> {
+        let mut thread_ids = self.non_root_thread_ids.clone();
+        thread_ids.extend(self.ineligible_thread_ids.iter().cloned());
+        if let Some(catalog_thread_ids) = self.catalog_non_root_thread_ids.get(path) {
+            thread_ids.extend(catalog_thread_ids.iter().cloned());
+        }
+        thread_ids
+    }
+}
+
 enum RemoteControlRolloutLookup {
     Ready(PathBuf),
     Archived,
@@ -174,7 +441,11 @@ enum RemoteControlRolloutLookup {
 
 impl SqliteUpdateCounts {
     fn total(&self) -> usize {
-        self.provider_rows + self.user_event_rows + self.cwd_rows + self.catalog_insert_rows
+        self.provider_rows
+            + self.user_event_rows
+            + self.cwd_rows
+            + self.catalog_insert_rows
+            + self.catalog_remove_rows
     }
 
     fn add(&mut self, other: Self) {
@@ -182,6 +453,7 @@ impl SqliteUpdateCounts {
         self.user_event_rows += other.user_event_rows;
         self.cwd_rows += other.cwd_rows;
         self.catalog_insert_rows += other.catalog_insert_rows;
+        self.catalog_remove_rows += other.catalog_remove_rows;
     }
 }
 
@@ -271,23 +543,26 @@ pub fn run_remote_control_session_catalog_recovery_for_thread_with_target(
         .map(Path::to_path_buf)
         .unwrap_or_else(default_codex_home_dir);
     let lock_dir = home.join("tmp/provider-sync.lock");
-    if acquire_lock(&lock_dir).is_err() {
-        return result(
-            ProviderSyncStatus::Skipped,
-            format!("Provider sync lock exists: {}", lock_dir.to_string_lossy()),
-            target_provider,
-            None,
-            0,
-            0,
-        );
-    }
+    let _lock_guard = match acquire_lock(&lock_dir) {
+        Ok(guard) => guard,
+        Err(_) => {
+            return result(
+                ProviderSyncStatus::Skipped,
+                format!("Provider sync lock exists: {}", lock_dir.to_string_lossy()),
+                target_provider,
+                None,
+                0,
+                0,
+            );
+        }
+    };
     let thread_ids = HashSet::from([thread_id.to_string()]);
     let recovery = run_remote_control_catalog_recovery_for_threads(
+        &home,
         &provider_sync_db_paths(&home),
         target_provider,
         &thread_ids,
     );
-    let _ = release_lock(&lock_dir);
     recovery.unwrap_or_else(|error| {
         result(
             ProviderSyncStatus::Skipped,
@@ -325,16 +600,19 @@ pub fn run_remote_control_session_finalization_for_thread_with_target(
         .map(Path::to_path_buf)
         .unwrap_or_else(default_codex_home_dir);
     let lock_dir = home.join("tmp/provider-sync.lock");
-    if acquire_lock(&lock_dir).is_err() {
-        return result(
-            ProviderSyncStatus::Skipped,
-            format!("Provider sync lock exists: {}", lock_dir.to_string_lossy()),
-            target_provider,
-            None,
-            0,
-            0,
-        );
-    }
+    let _lock_guard = match acquire_lock(&lock_dir) {
+        Ok(guard) => guard,
+        Err(_) => {
+            return result(
+                ProviderSyncStatus::Skipped,
+                format!("Provider sync lock exists: {}", lock_dir.to_string_lossy()),
+                target_provider,
+                None,
+                0,
+                0,
+            );
+        }
+    };
     let recovery = (|| -> anyhow::Result<ProviderSyncResult> {
         let sqlite_paths = provider_sync_db_paths(&home);
         let rollout_path = match remote_control_rollout_for_thread(
@@ -402,7 +680,8 @@ pub fn run_remote_control_session_finalization_for_thread_with_target(
             return Ok(deferred);
         }
         let thread_ids = HashSet::from([thread_id.to_string()]);
-        let catalog_insert_rows = repair_missing_local_thread_catalog_rows_for_threads(
+        let catalog_repairs = repair_missing_local_thread_catalog_rows_for_threads(
+            &home,
             &sqlite_paths,
             target_provider,
             &thread_ids,
@@ -412,7 +691,8 @@ pub fn run_remote_control_session_finalization_for_thread_with_target(
             target_provider,
             &thread_ids,
         )?;
-        sqlite_updates.catalog_insert_rows = catalog_insert_rows;
+        sqlite_updates.catalog_insert_rows = catalog_repairs.inserted_rows;
+        sqlite_updates.catalog_remove_rows = catalog_repairs.removed_rows;
         prune_backups(&home)?;
         let mut synced = result(
             ProviderSyncStatus::Synced,
@@ -424,9 +704,9 @@ pub fn run_remote_control_session_finalization_for_thread_with_target(
         );
         synced.sqlite_provider_rows_updated = sqlite_updates.provider_rows;
         synced.sqlite_catalog_rows_inserted = sqlite_updates.catalog_insert_rows;
+        synced.sqlite_catalog_rows_removed = sqlite_updates.catalog_remove_rows;
         Ok(synced)
     })();
-    let _ = release_lock(&lock_dir);
     recovery.unwrap_or_else(|error| {
         result(
             ProviderSyncStatus::Skipped,
@@ -440,6 +720,7 @@ pub fn run_remote_control_session_finalization_for_thread_with_target(
 }
 
 fn run_remote_control_catalog_recovery_for_threads(
+    home: &Path,
     sqlite_paths: &[PathBuf],
     target_provider: &str,
     requested_thread_ids: &HashSet<String>,
@@ -460,7 +741,8 @@ fn run_remote_control_catalog_recovery_for_threads(
         ));
     }
 
-    let catalog_insert_rows = repair_missing_local_thread_catalog_rows_for_threads(
+    let catalog_repairs = repair_missing_local_thread_catalog_rows_for_threads(
+        home,
         sqlite_paths,
         target_provider,
         &thread_ids,
@@ -473,10 +755,11 @@ fn run_remote_control_catalog_recovery_for_threads(
         target_provider,
         None,
         0,
-        provider_rows + catalog_insert_rows,
+        provider_rows + catalog_repairs.total(),
     );
     synced.sqlite_provider_rows_updated = provider_rows;
-    synced.sqlite_catalog_rows_inserted = catalog_insert_rows;
+    synced.sqlite_catalog_rows_inserted = catalog_repairs.inserted_rows;
+    synced.sqlite_catalog_rows_removed = catalog_repairs.removed_rows;
     Ok(synced)
 }
 
@@ -484,6 +767,7 @@ pub fn run_provider_sync_with_target(
     codex_home: Option<&Path>,
     explicit_target_provider: Option<&str>,
 ) -> ProviderSyncResult {
+    let require_stopped_app = codex_home.is_none();
     let home = codex_home
         .map(Path::to_path_buf)
         .unwrap_or_else(default_codex_home_dir);
@@ -511,19 +795,67 @@ pub fn run_provider_sync_with_target(
                 );
             }
         };
-    let lock_dir = home.join("tmp/provider-sync.lock");
-    if acquire_lock(&lock_dir).is_err() {
-        return result(
-            ProviderSyncStatus::Skipped,
-            format!("Provider sync lock exists: {}", lock_dir.to_string_lossy()),
-            &target_provider,
-            None,
-            0,
-            0,
-        );
+    if require_stopped_app {
+        let running_processes =
+            codex_plus_core::watcher::find_session_index_cleanup_blocking_processes();
+        if !running_processes.is_empty() {
+            return result(
+                ProviderSyncStatus::Skipped,
+                format!(
+                    "Codex App / ChatGPT 仍在运行（进程：{}）；请完全退出 App 后再修复历史会话",
+                    running_processes
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                &target_provider,
+                None,
+                0,
+                0,
+            );
+        }
     }
+    let lock_dir = home.join("tmp/provider-sync.lock");
+    let _lock_guard = match acquire_lock(&lock_dir) {
+        Ok(guard) => guard,
+        Err(_) => {
+            return result(
+                ProviderSyncStatus::Skipped,
+                format!("Provider sync lock exists: {}", lock_dir.to_string_lossy()),
+                &target_provider,
+                None,
+                0,
+                0,
+            );
+        }
+    };
     let sync_result = (|| -> anyhow::Result<ProviderSyncResult> {
-        let collected = collect_session_changes(&home, &target_provider)?;
+        let sqlite_paths = provider_sync_db_paths(&home);
+        let thread_kinds = sqlite_provider_sync_thread_kinds(&sqlite_paths)?;
+        let repair_audit = match audit_provider_sync_state(&home, &sqlite_paths) {
+            Ok(audit) => audit,
+            Err(error) => {
+                let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                    "provider_sync.repair_audit_failed",
+                    json!({
+                        "error": error.to_string(),
+                        "backup_root": home
+                            .join("backups_state/provider-sync")
+                            .to_string_lossy(),
+                    }),
+                );
+                ProviderSyncAudit::default()
+            }
+        };
+        let collected = collect_session_changes(
+            &home,
+            &target_provider,
+            &thread_kinds.subagent_thread_ids,
+            &thread_kinds.explicit_user_thread_ids,
+        )?;
+        let mut subagent_thread_ids = thread_kinds.subagent_thread_ids;
+        subagent_thread_ids.extend(collected.subagent_thread_ids.iter().cloned());
         let encrypted_content_warning =
             build_encrypted_content_warning(&collected.encrypted_content_counts, &target_provider);
         let rewrite_changes = collected
@@ -546,20 +878,20 @@ pub fn run_provider_sync_with_target(
             .filter_map(|change| Some((change.thread_id.clone()?, change.cwd.clone()?)))
             .filter(|(thread_id, _)| !projectless_thread_ids.contains(thread_id))
             .collect::<HashMap<_, _>>();
-        let sqlite_paths = provider_sync_db_paths(&home);
         let sqlite_update_count = count_sqlite_updates_for_paths(
             &sqlite_paths,
             &target_provider,
             &thread_ids_with_user_events,
             &cwd_by_thread_id,
+            &subagent_thread_ids,
         )?;
-        let catalog_insert_count =
-            count_missing_local_thread_catalog_rows(&sqlite_paths, &target_provider)?;
+        let catalog_repair_count =
+            count_local_thread_catalog_repairs(&home, &sqlite_paths, &target_provider)?;
         let global_state_update_count =
             count_global_state_updates(&home.join(".codex-global-state.json"))?;
         if rewrite_changes.is_empty()
             && sqlite_update_count == 0
-            && catalog_insert_count == 0
+            && catalog_repair_count == 0
             && global_state_update_count == 0
         {
             let mut synced = result(
@@ -572,6 +904,9 @@ pub fn run_provider_sync_with_target(
             );
             synced.skipped_locked_rollout_files = collected.skipped_locked_rollout_files;
             synced.encrypted_content_warning = encrypted_content_warning;
+            synced.repair_audit = repair_audit;
+            synced.message =
+                provider_sync_message_with_audit(&synced.message, &synced.repair_audit);
             return Ok(synced);
         }
         let backup_dir = create_backup(&home, &target_provider, &rewrite_changes)?;
@@ -582,10 +917,13 @@ pub fn run_provider_sync_with_target(
                 &target_provider,
                 &thread_ids_with_user_events,
                 &cwd_by_thread_id,
+                &subagent_thread_ids,
             )?;
             let mut sqlite_updates = sqlite_updates;
-            sqlite_updates.catalog_insert_rows =
-                repair_missing_local_thread_catalog_rows(&sqlite_paths, &target_provider)?;
+            let catalog_repairs =
+                repair_missing_local_thread_catalog_rows(&home, &sqlite_paths, &target_provider)?;
+            sqlite_updates.catalog_insert_rows = catalog_repairs.inserted_rows;
+            sqlite_updates.catalog_remove_rows = catalog_repairs.removed_rows;
             let updated_workspace_roots =
                 apply_global_state_update(&home.join(".codex-global-state.json"))?;
             prune_backups(&home)?;
@@ -616,11 +954,13 @@ pub fn run_provider_sync_with_target(
         synced.sqlite_user_event_rows_updated = sqlite_updates.user_event_rows;
         synced.sqlite_cwd_rows_updated = sqlite_updates.cwd_rows;
         synced.sqlite_catalog_rows_inserted = sqlite_updates.catalog_insert_rows;
+        synced.sqlite_catalog_rows_removed = sqlite_updates.catalog_remove_rows;
         synced.updated_workspace_roots = updated_workspace_roots;
         synced.encrypted_content_warning = encrypted_content_warning;
+        synced.repair_audit = repair_audit;
+        synced.message = provider_sync_message_with_audit(&synced.message, &synced.repair_audit);
         Ok(synced)
     })();
-    let _ = release_lock(&lock_dir);
     sync_result.unwrap_or_else(|err| {
         result(
             ProviderSyncStatus::Skipped,
@@ -653,9 +993,24 @@ fn result(
         sqlite_user_event_rows_updated: 0,
         sqlite_cwd_rows_updated: 0,
         sqlite_catalog_rows_inserted: 0,
+        sqlite_catalog_rows_removed: 0,
         updated_workspace_roots: 0,
         encrypted_content_warning: None,
+        repair_audit: ProviderSyncAudit::default(),
     }
+}
+
+fn provider_sync_message_with_audit(message: &str, audit: &ProviderSyncAudit) -> String {
+    if audit.catalog_only_sessions == 0 {
+        return message.to_string();
+    }
+    format!(
+        "{message}；审计发现 {} 条仅存在于本地会话目录的记录，其中 {} 条仍有当前 rollout、{} 条只能在历史数据库备份中找到，{} 条没有可用恢复来源；未自动重建缺失的 canonical 会话。",
+        audit.catalog_only_sessions,
+        audit.catalog_only_with_current_rollout,
+        audit.catalog_only_with_backup_database,
+        audit.catalog_only_without_recovery_source,
+    )
 }
 
 fn provider_sync_db_paths(home: &Path) -> Vec<PathBuf> {
@@ -666,6 +1021,98 @@ fn provider_sync_db_paths(home: &Path) -> Vec<PathBuf> {
         }
     }
     paths
+}
+
+fn audit_provider_sync_state(
+    home: &Path,
+    sqlite_paths: &[PathBuf],
+) -> anyhow::Result<ProviderSyncAudit> {
+    let mut canonical_thread_ids = HashSet::new();
+    let mut catalog_thread_ids = HashSet::new();
+    for path in sqlite_paths {
+        canonical_thread_ids.extend(sqlite_table_ids(path, "threads", "id")?);
+        catalog_thread_ids.extend(sqlite_user_thread_ids(path)?);
+    }
+
+    let catalog_only = catalog_thread_ids
+        .difference(&canonical_thread_ids)
+        .cloned()
+        .collect::<HashSet<_>>();
+    if catalog_only.is_empty() {
+        return Ok(ProviderSyncAudit::default());
+    }
+
+    let current_rollout_ids = rollout_files(home)?
+        .into_iter()
+        .filter_map(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .and_then(rollout_thread_id_from_filename)
+        })
+        .collect::<HashSet<_>>();
+    let backup_database_ids = backup_database_thread_ids(home)?;
+    let with_current_rollout = catalog_only
+        .iter()
+        .filter(|thread_id| current_rollout_ids.contains(*thread_id))
+        .count();
+    let with_backup_database = catalog_only
+        .iter()
+        .filter(|thread_id| {
+            !current_rollout_ids.contains(*thread_id) && backup_database_ids.contains(*thread_id)
+        })
+        .count();
+
+    Ok(ProviderSyncAudit {
+        catalog_only_sessions: catalog_only.len(),
+        catalog_only_with_current_rollout: with_current_rollout,
+        catalog_only_with_backup_database: with_backup_database,
+        catalog_only_without_recovery_source: catalog_only
+            .iter()
+            .filter(|thread_id| {
+                !current_rollout_ids.contains(*thread_id)
+                    && !backup_database_ids.contains(*thread_id)
+            })
+            .count(),
+    })
+}
+
+fn backup_database_thread_ids(home: &Path) -> anyhow::Result<HashSet<String>> {
+    let root = home.join("backups_state/provider-sync");
+    let mut ids = HashSet::new();
+    if !root.exists() {
+        return Ok(ids);
+    }
+    let mut files = Vec::new();
+    collect_files_recursive(&root, &mut files)?;
+    for path in files {
+        if !matches!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("sqlite" | "db")
+        ) {
+            continue;
+        }
+        if let Ok(thread_ids) = sqlite_table_ids(&path, "threads", "id") {
+            ids.extend(thread_ids);
+        }
+    }
+    Ok(ids)
+}
+
+fn collect_files_recursive(root: &Path, files: &mut Vec<PathBuf>) -> anyhow::Result<()> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if file_type.is_dir() {
+            collect_files_recursive(&path, files)?;
+        } else if file_type.is_file() {
+            files.push(path);
+        }
+    }
+    Ok(())
 }
 
 pub fn load_provider_sync_targets(codex_home: Option<&Path>) -> ProviderSyncTargetList {
@@ -846,23 +1293,172 @@ fn toml_string_value(raw: &str) -> Option<String> {
     None
 }
 
-fn acquire_lock(path: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(path.parent().unwrap_or_else(|| Path::new(".")))?;
-    fs::create_dir(path)?;
-    fs::write(
-        path.join("owner.json"),
-        json!({"pid": std::process::id(), "startedAt": now_secs()}).to_string(),
-    )
+fn acquire_lock(path: &Path) -> std::io::Result<ProviderSyncLifecycleGuard> {
+    acquire_lock_inner(path, true)
 }
 
-fn release_lock(path: &Path) -> std::io::Result<()> {
-    if path.exists() {
-        fs::remove_dir_all(path)?;
+fn acquire_lock_inner(path: &Path, log_busy: bool) -> std::io::Result<ProviderSyncLifecycleGuard> {
+    fs::create_dir_all(path.parent().unwrap_or_else(|| Path::new(".")))?;
+    let lifecycle_path = path.with_file_name("provider-sync.lifecycle.lock");
+    let lock_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(lifecycle_path)?;
+    if let Err(error) = lock_file.try_lock_exclusive() {
+        let error = normalize_lock_contention_error(error);
+        if log_busy {
+            log_lock_busy(path);
+        }
+        return Err(error);
+    }
+    let lock_id = uuid::Uuid::new_v4().to_string();
+    match create_lock(path, &lock_id) {
+        Ok(()) => Ok(ProviderSyncLifecycleGuard {
+            lock_dir: path.to_path_buf(),
+            lock_file,
+            lock_id,
+            directory_released: false,
+            file_unlocked: false,
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let Some((owner, isolated_path)) = isolate_stale_lock(path) else {
+                if log_busy {
+                    log_lock_busy(path);
+                }
+                return Err(error);
+            };
+            match create_lock(path, &lock_id) {
+                Ok(()) => {
+                    let quarantine_cleanup_failed = fs::remove_dir_all(&isolated_path).is_err();
+                    let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                        "provider_sync.stale_lock_recovered",
+                        json!({
+                            "owner_pid": owner.as_ref().map(|owner| owner.pid),
+                            "owner_started_at": owner.as_ref().map(|owner| owner.started_at),
+                            "owner_process_started_at": owner
+                                .as_ref()
+                                .and_then(|owner| owner.process_started_at),
+                            // owner 缺失说明持有者是在建锁中途被强杀的（issue #1901）
+                            "interrupted": owner.is_none(),
+                            "quarantine_cleanup_failed": quarantine_cleanup_failed,
+                        }),
+                    );
+                    Ok(ProviderSyncLifecycleGuard {
+                        lock_dir: path.to_path_buf(),
+                        lock_file,
+                        lock_id,
+                        directory_released: false,
+                        file_unlocked: false,
+                    })
+                }
+                Err(retry_error) => {
+                    let _ = fs::remove_dir_all(isolated_path);
+                    Err(retry_error)
+                }
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn normalize_lock_contention_error(error: std::io::Error) -> std::io::Error {
+    #[cfg(windows)]
+    if error.raw_os_error() == Some(33) {
+        return std::io::Error::new(std::io::ErrorKind::WouldBlock, error);
+    }
+    error
+}
+
+/// 锁没能拿到时留下现场，用于区分「另一个同步真的在跑」和「残留锁把同步永久卡死」。
+fn log_lock_busy(path: &Path) {
+    let state = inspect_lock(path);
+    let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+        "provider_sync.lock_busy",
+        json!({
+            "lock_dir": path.to_string_lossy(),
+            "state": state,
+            "age_secs": lock_dir_age_secs(path),
+        }),
+    );
+}
+
+fn create_lock(path: &Path, lock_id: &str) -> std::io::Result<()> {
+    fs::create_dir(path)?;
+    let (process_started_at, process_birth_id) = current_process_identity();
+    let write_result = fs::write(
+        path.join("owner.json"),
+        json!({
+            "pid": std::process::id(),
+            "startedAt": now_secs(),
+            "processStartedAt": process_started_at,
+            "processBirthId": process_birth_id,
+            "lockId": lock_id,
+        })
+        .to_string(),
+    );
+    if let Err(error) = write_result {
+        let _ = fs::remove_dir_all(path);
+        return Err(error);
     }
     Ok(())
 }
 
-fn collect_session_changes(home: &Path, target_provider: &str) -> anyhow::Result<SessionChanges> {
+/// 在已经持有 OS 生命周期锁时，把可回收的兼容目录挪到隔离路径，让调用方重新建锁。
+///
+/// 三种可回收的形态：
+/// - owner.json 带 `lockId`，证明目录来自新版协议；OS 锁既然已取得，该目录必为孤儿；
+/// - owner.json 可读且持有进程已退出（正常的崩溃残留）；
+/// - owner.json 缺失/损坏，且锁目录存在时间已超过 [`LOCK_INTERRUPTED_GRACE_SECS`]
+///   ——持有者在 `create_lock` 中途被强杀，不会再有人来补写 owner（issue #1901）。
+///
+/// 其余情况一律保留锁：宁可跳过一次同步，也不能抢走仍在写入的进程的锁。
+fn isolate_stale_lock(path: &Path) -> Option<(Option<ProviderSyncLockOwner>, PathBuf)> {
+    let parsed_owner = read_lock_owner(path);
+    let owner = if parsed_owner
+        .as_ref()
+        .and_then(|owner| owner.lock_id.as_ref())
+        .is_some()
+    {
+        parsed_owner
+    } else {
+        match inspect_lock(path) {
+            ProviderSyncLockState::Stale { .. } => parsed_owner,
+            _ => return None,
+        }
+    };
+    let file_name = path.file_name()?.to_string_lossy();
+    let owner_tag = owner
+        .as_ref()
+        .map_or_else(|| "interrupted".to_string(), |owner| owner.pid.to_string());
+    let isolated_path = path.with_file_name(format!(
+        "{file_name}.stale-{owner_tag}-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::rename(path, &isolated_path).ok()?;
+    Some((owner, isolated_path))
+}
+
+fn release_owned_lock(path: &Path, lock_id: &str) -> std::io::Result<bool> {
+    if !path.exists() {
+        return Ok(true);
+    }
+    if read_lock_owner(path)
+        .and_then(|owner| owner.lock_id)
+        .is_some_and(|owner_lock_id| owner_lock_id == lock_id)
+    {
+        fs::remove_dir_all(path)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn collect_session_changes(
+    home: &Path,
+    target_provider: &str,
+    excluded_thread_ids: &HashSet<String>,
+    explicit_user_thread_ids: &HashSet<String>,
+) -> anyhow::Result<SessionChanges> {
     let mut collected = SessionChanges::default();
     for path in rollout_files(home)? {
         let text = match fs::read_to_string(&path) {
@@ -875,6 +1471,24 @@ fn collect_session_changes(home: &Path, target_provider: &str) -> anyhow::Result
         };
         let rewrite = rewrite_rollout_session_meta_providers(&text, target_provider)?;
         if rewrite.session_meta_count == 0 {
+            continue;
+        }
+        let is_explicit_user = rewrite
+            .thread_id
+            .as_ref()
+            .is_some_and(|thread_id| explicit_user_thread_ids.contains(thread_id));
+        if rollout_session_meta_marks_non_root_agent(&text) {
+            if let Some(thread_id) = &rewrite.thread_id {
+                collected.subagent_thread_ids.insert(thread_id.clone());
+            }
+            continue;
+        }
+        if !is_explicit_user
+            && rewrite
+                .thread_id
+                .as_ref()
+                .is_some_and(|thread_id| excluded_thread_ids.contains(thread_id))
+        {
             continue;
         }
         let has_user_event = text.contains("\"user_message\"") || text.contains("\"user_input\"");
@@ -900,6 +1514,19 @@ fn collect_session_changes(home: &Path, target_provider: &str) -> anyhow::Result
         });
     }
     Ok(collected)
+}
+
+fn rollout_session_meta_marks_non_root_agent(text: &str) -> bool {
+    text.lines().any(|line| {
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            return false;
+        };
+        record.get("type").and_then(Value::as_str) == Some("session_meta")
+            && record
+                .get("payload")
+                .and_then(|payload| payload.get("source"))
+                .is_some_and(source_value_marks_non_root_agent)
+    })
 }
 
 fn remote_control_rollout_for_thread(
@@ -1321,6 +1948,53 @@ fn sqlite_thread_ids(path: &Path) -> anyhow::Result<HashSet<String>> {
     Ok(ids)
 }
 
+fn sqlite_table_ids(path: &Path, table: &str, column: &str) -> anyhow::Result<HashSet<String>> {
+    if !path.exists() {
+        return Ok(HashSet::new());
+    }
+    let db = Connection::open(path)?;
+    if !table_columns(&db, table)?.contains(column) {
+        return Ok(HashSet::new());
+    }
+    let sql = format!("SELECT DISTINCT {column} FROM {table} WHERE COALESCE({column}, '') <> ''");
+    Ok(db
+        .prepare(&sql)?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<HashSet<_>>>()?)
+}
+
+fn sqlite_user_thread_ids(path: &Path) -> anyhow::Result<HashSet<String>> {
+    if !path.exists() {
+        return Ok(HashSet::new());
+    }
+    let db = Connection::open(path)?;
+    let columns = table_columns(&db, "local_thread_catalog")?;
+    if !columns.contains("thread_id") {
+        return Ok(HashSet::new());
+    }
+    let source_kind = text_expr(&columns, "source_kind", "''");
+    let thread_source = text_expr(&columns, "thread_source", "NULL");
+    let sql = format!(
+        "SELECT thread_id, {source_kind}, {thread_source} FROM local_thread_catalog WHERE COALESCE(thread_id, '') <> ''"
+    );
+    let mut ids = HashSet::new();
+    for row in db.prepare(&sql)?.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1).unwrap_or_default(),
+            row.get::<_, Option<String>>(2).unwrap_or(None),
+        ))
+    })? {
+        let (thread_id, source_kind, thread_source) = row?;
+        if !thread_source_marks_non_root(thread_source.as_deref())
+            && !source_marks_non_root_agent(&source_kind)
+        {
+            ids.insert(thread_id);
+        }
+    }
+    Ok(ids)
+}
+
 fn plan_session_index_cleanup(
     path: &Path,
     live_thread_ids: &HashSet<String>,
@@ -1430,7 +2104,7 @@ pub fn apply_session_index_cleanup(
         .map(Path::to_path_buf)
         .unwrap_or_else(default_codex_home_dir);
     let lock_dir = home.join("tmp/provider-sync.lock");
-    acquire_lock(&lock_dir).map_err(|error| cleanup_apply_error(error, None))?;
+    let _lock_guard = acquire_lock(&lock_dir).map_err(|error| cleanup_apply_error(error, None))?;
     let result = (|| {
         let sqlite_paths =
             codex_plus_core::codex_sqlite::codex_thread_reference_db_paths_from_home(&home);
@@ -1500,8 +2174,114 @@ pub fn apply_session_index_cleanup(
             backup_dir: Some(backup_dir),
         })
     })();
-    let _ = release_lock(&lock_dir);
     result
+}
+
+/// Return the `session_index.jsonl` lines (without trailing newline) that
+/// reference `thread_id`. Used by the delete flow to keep a backup of the
+/// entries it is about to remove.
+pub fn session_index_lines_for_thread(
+    codex_home: &Path,
+    thread_id: &str,
+) -> anyhow::Result<Vec<String>> {
+    let path = codex_home.join("session_index.jsonl");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = fs::read_to_string(&path)?;
+    let mut lines = Vec::new();
+    for segment in text.split_inclusive('\n') {
+        let (line, _) = split_line_ending(segment);
+        if known_session_index_candidate(line).is_some_and(|candidate| candidate.id == thread_id) {
+            lines.push(line.to_string());
+        }
+    }
+    Ok(lines)
+}
+
+/// Remove every `session_index.jsonl` entry for `thread_id` and write the
+/// result back atomically. Returns the number of removed entries.
+///
+/// Best-effort: returns `Ok(0)` without writing when the file is missing or
+/// changed since it was read, so a delete flow never clobbers fresh entries.
+pub fn remove_session_index_entry(
+    codex_home: &Path,
+    thread_id: &str,
+) -> anyhow::Result<usize> {
+    let path = codex_home.join("session_index.jsonl");
+    if !path.exists() {
+        return Ok(0);
+    }
+    let original_bytes = fs::read(&path)?;
+    let original_text = String::from_utf8(original_bytes.clone())?;
+    let plan = SessionIndexPlan {
+        path,
+        snapshot_sha256: sha256_hex(&original_bytes),
+        original_bytes,
+        original_text,
+        candidates: Vec::new(),
+    };
+    let selected_ids = HashSet::from([thread_id.to_string()]);
+    let (next_text, removed_entries) = filtered_session_index_text(&plan, &selected_ids);
+    if removed_entries == 0 {
+        return Ok(0);
+    }
+    if fs::read(&plan.path)? != plan.original_bytes {
+        return Ok(0);
+    }
+    codex_plus_core::settings::atomic_write(&plan.path, next_text.as_bytes())?;
+    Ok(removed_entries)
+}
+
+/// Append previously removed `session_index.jsonl` lines back (undo flow).
+/// Lines whose `id` already exists are skipped. Returns the number of
+/// appended lines. Best-effort: returns `Ok(0)` without writing when the
+/// file changed since it was read.
+pub fn restore_session_index_entries(
+    codex_home: &Path,
+    lines: &[String],
+) -> anyhow::Result<usize> {
+    if lines.is_empty() {
+        return Ok(0);
+    }
+    let path = codex_home.join("session_index.jsonl");
+    let original_bytes = if path.exists() {
+        fs::read(&path)?
+    } else {
+        Vec::new()
+    };
+    let original_text = String::from_utf8(original_bytes.clone())?;
+    let mut existing_ids = HashSet::new();
+    for segment in original_text.split_inclusive('\n') {
+        let (line, _) = split_line_ending(segment);
+        if let Some(candidate) = known_session_index_candidate(line) {
+            existing_ids.insert(candidate.id);
+        }
+    }
+    let mut next_text = original_text;
+    if !next_text.is_empty() && !next_text.ends_with('\n') {
+        next_text.push('\n');
+    }
+    let mut appended = 0usize;
+    for line in lines {
+        if let Some(candidate) = known_session_index_candidate(line) {
+            if existing_ids.contains(&candidate.id) {
+                continue;
+            }
+            existing_ids.insert(candidate.id);
+        }
+        next_text.push_str(line);
+        next_text.push('\n');
+        appended += 1;
+    }
+    if appended == 0 {
+        return Ok(0);
+    }
+    if fs::read(&path)? != original_bytes {
+        return Ok(0);
+    }
+    codex_plus_core::settings::atomic_write(&path, next_text.as_bytes())?;
+    Ok(appended)
 }
 
 fn ensure_codex_app_stopped(
@@ -1844,8 +2624,15 @@ fn sqlite_provider_ids(path: &Path) -> anyhow::Result<Vec<String>> {
         if !columns.contains("model_provider") {
             continue;
         }
+        let subagent_filter = if table == "threads" {
+            subagent_filter(&db, "threads.id")?
+        } else if columns.contains("thread_id") {
+            subagent_filter(&db, "local_thread_catalog.thread_id")?
+        } else {
+            String::new()
+        };
         let mut stmt = db.prepare(&format!(
-            "SELECT DISTINCT COALESCE(model_provider, '') FROM {table} WHERE COALESCE(model_provider, '') <> ''"
+            "SELECT DISTINCT COALESCE(model_provider, '') FROM {table} WHERE COALESCE(model_provider, '') <> ''{subagent_filter}"
         ))?;
         for item in stmt.query_map([], |row| row.get::<_, String>(0))? {
             let id = item?;
@@ -1855,6 +2642,97 @@ fn sqlite_provider_ids(path: &Path) -> anyhow::Result<Vec<String>> {
         }
     }
     Ok(sorted_provider_ids(ids))
+}
+
+fn sqlite_provider_sync_thread_kinds(
+    paths: &[PathBuf],
+) -> anyhow::Result<ProviderSyncThreadKinds> {
+    let mut kinds = ProviderSyncThreadKinds::default();
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        let db = Connection::open(path)?;
+        for (table, column) in [
+            ("thread_spawn_edges", "child_thread_id"),
+            ("agent_job_items", "assigned_thread_id"),
+        ] {
+            if !table_columns(&db, table)?.contains(column) {
+                continue;
+            }
+            let sql =
+                format!("SELECT DISTINCT {column} FROM {table} WHERE COALESCE({column}, '') <> ''");
+            kinds.subagent_thread_ids.extend(
+                db.prepare(&sql)?
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<HashSet<_>>>()?,
+            );
+        }
+
+        for (table, id_column, source_column) in [
+            ("threads", "id", "source"),
+            ("local_thread_catalog", "thread_id", "source_kind"),
+        ] {
+            let columns = table_columns(&db, table)?;
+            if !columns.contains(id_column) {
+                continue;
+            }
+            let source = text_expr(&columns, source_column, "''");
+            let thread_source = text_expr(&columns, "thread_source", "NULL");
+            let sql = format!(
+                "SELECT {id_column}, {source}, {thread_source} FROM {table} WHERE COALESCE({id_column}, '') <> ''"
+            );
+            let mut stmt = db.prepare(&sql)?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1).unwrap_or_default(),
+                    row.get::<_, Option<String>>(2).unwrap_or(None),
+                ))
+            })?;
+            for row in rows {
+                let (thread_id, source, thread_source) = row?;
+                if source_structured_marks_non_root_agent(&source)
+                    || thread_source_marks_non_root(thread_source.as_deref())
+                {
+                    kinds.subagent_thread_ids.insert(thread_id);
+                } else if thread_source_is_user(thread_source.as_deref()) {
+                    kinds.explicit_user_thread_ids.insert(thread_id);
+                } else if source_marks_non_root_agent(&source) {
+                    kinds.subagent_thread_ids.insert(thread_id);
+                }
+            }
+        }
+    }
+    kinds
+        .subagent_thread_ids
+        .retain(|thread_id| !kinds.explicit_user_thread_ids.contains(thread_id));
+    Ok(kinds)
+}
+
+fn subagent_filter(db: &Connection, id_expr: &str) -> anyhow::Result<String> {
+    let mut filters = Vec::new();
+    if table_columns(db, "thread_spawn_edges")?
+        .iter()
+        .any(|column| column == "child_thread_id")
+    {
+        filters.push(format!(
+            "NOT EXISTS (SELECT 1 FROM thread_spawn_edges e WHERE e.child_thread_id = {id_expr})"
+        ));
+    }
+    if table_columns(db, "agent_job_items")?
+        .iter()
+        .any(|column| column == "assigned_thread_id")
+    {
+        filters.push(format!(
+            "NOT EXISTS (SELECT 1 FROM agent_job_items j WHERE j.assigned_thread_id = {id_expr})"
+        ));
+    }
+    if filters.is_empty() {
+        Ok(String::new())
+    } else {
+        Ok(format!(" AND {}", filters.join(" AND ")))
+    }
 }
 
 fn remote_control_catalog_recovery_thread_ids(
@@ -1963,11 +2841,33 @@ fn rollout_thread_provider_state(text: &str) -> Option<(String, HashSet<String>)
     thread_id.map(|thread_id| (thread_id, providers))
 }
 
+fn provider_update_thread_ids(
+    db: &Connection,
+    table: &str,
+    id_column: &str,
+    target_provider: &str,
+    excluded_thread_ids: &HashSet<String>,
+) -> anyhow::Result<Vec<String>> {
+    let sql = format!(
+        "SELECT {id_column} FROM {table} WHERE COALESCE({id_column}, '') <> '' AND COALESCE(model_provider, '') <> ?1"
+    );
+    let mut stmt = db.prepare(&sql)?;
+    let mut thread_ids = Vec::new();
+    for item in stmt.query_map([target_provider], |row| row.get::<_, String>(0))? {
+        let thread_id = item?;
+        if !excluded_thread_ids.contains(&thread_id) {
+            thread_ids.push(thread_id);
+        }
+    }
+    Ok(thread_ids)
+}
+
 fn count_sqlite_updates(
     path: &Path,
     target_provider: &str,
     user_event_thread_ids: &HashSet<String>,
     cwd_by_thread_id: &HashMap<String, String>,
+    excluded_thread_ids: &HashSet<String>,
 ) -> anyhow::Result<usize> {
     if !path.exists() {
         return Ok(0);
@@ -1976,22 +2876,31 @@ fn count_sqlite_updates(
     let columns = table_columns(&db, "threads")?;
     let catalog_columns = table_columns(&db, "local_thread_catalog")?;
     let mut total = 0;
-    if columns.contains("model_provider") {
-        total += db.query_row(
-            "SELECT COUNT(*) FROM threads WHERE COALESCE(model_provider, '') <> ?1",
-            [target_provider],
-            |row| row.get::<_, i64>(0),
-        )? as usize;
+    if columns.contains("id") && columns.contains("model_provider") {
+        total += provider_update_thread_ids(
+            &db,
+            "threads",
+            "id",
+            target_provider,
+            excluded_thread_ids,
+        )?
+        .len();
     }
-    if catalog_columns.contains("model_provider") {
-        total += db.query_row(
-            "SELECT COUNT(*) FROM local_thread_catalog WHERE COALESCE(model_provider, '') <> ?1",
-            [target_provider],
-            |row| row.get::<_, i64>(0),
-        )? as usize;
+    if catalog_columns.contains("thread_id") && catalog_columns.contains("model_provider") {
+        total += provider_update_thread_ids(
+            &db,
+            "local_thread_catalog",
+            "thread_id",
+            target_provider,
+            excluded_thread_ids,
+        )?
+        .len();
     }
     if columns.contains("has_user_event") {
         for thread_id in user_event_thread_ids {
+            if excluded_thread_ids.contains(thread_id) {
+                continue;
+            }
             total += db.query_row(
                 "SELECT COUNT(*) FROM threads WHERE id = ?1 AND COALESCE(has_user_event, 0) <> 1",
                 [thread_id],
@@ -2001,6 +2910,9 @@ fn count_sqlite_updates(
     }
     if columns.contains("cwd") {
         for (thread_id, cwd) in cwd_by_thread_id {
+            if excluded_thread_ids.contains(thread_id) {
+                continue;
+            }
             total += db.query_row(
                 "SELECT COUNT(*) FROM threads WHERE id = ?1 AND COALESCE(cwd, '') <> ?2",
                 (thread_id, cwd),
@@ -2016,6 +2928,7 @@ fn count_sqlite_updates_for_paths(
     target_provider: &str,
     user_event_thread_ids: &HashSet<String>,
     cwd_by_thread_id: &HashMap<String, String>,
+    excluded_thread_ids: &HashSet<String>,
 ) -> anyhow::Result<usize> {
     let mut total = 0;
     for path in paths {
@@ -2024,6 +2937,7 @@ fn count_sqlite_updates_for_paths(
             target_provider,
             user_event_thread_ids,
             cwd_by_thread_id,
+            excluded_thread_ids,
         )?;
     }
     Ok(total)
@@ -2034,6 +2948,7 @@ fn apply_sqlite_update(
     target_provider: &str,
     user_event_thread_ids: &HashSet<String>,
     cwd_by_thread_id: &HashMap<String, String>,
+    excluded_thread_ids: &HashSet<String>,
 ) -> anyhow::Result<SqliteUpdateCounts> {
     if !path.exists() {
         return Ok(SqliteUpdateCounts::default());
@@ -2046,20 +2961,39 @@ fn apply_sqlite_update(
     }
     let tx = db.transaction()?;
     let mut counts = SqliteUpdateCounts::default();
-    if columns.contains("model_provider") {
-        counts.provider_rows += tx.execute(
-            "UPDATE threads SET model_provider = ?1 WHERE COALESCE(model_provider, '') <> ?1",
-            [target_provider],
-        )?;
+    if columns.contains("id") && columns.contains("model_provider") {
+        for thread_id in provider_update_thread_ids(
+            &tx,
+            "threads",
+            "id",
+            target_provider,
+            excluded_thread_ids,
+        )? {
+            counts.provider_rows += tx.execute(
+                "UPDATE threads SET model_provider = ?1 WHERE id = ?2 AND COALESCE(model_provider, '') <> ?1",
+                (target_provider, thread_id),
+            )?;
+        }
     }
-    if catalog_columns.contains("model_provider") {
-        counts.provider_rows += tx.execute(
-            "UPDATE local_thread_catalog SET model_provider = ?1 WHERE COALESCE(model_provider, '') <> ?1",
-            [target_provider],
-        )?;
+    if catalog_columns.contains("thread_id") && catalog_columns.contains("model_provider") {
+        for thread_id in provider_update_thread_ids(
+            &tx,
+            "local_thread_catalog",
+            "thread_id",
+            target_provider,
+            excluded_thread_ids,
+        )? {
+            counts.provider_rows += tx.execute(
+                "UPDATE local_thread_catalog SET model_provider = ?1 WHERE thread_id = ?2 AND COALESCE(model_provider, '') <> ?1",
+                (target_provider, thread_id),
+            )?;
+        }
     }
     if columns.contains("has_user_event") {
         for thread_id in user_event_thread_ids {
+            if excluded_thread_ids.contains(thread_id) {
+                continue;
+            }
             counts.user_event_rows += tx.execute(
                 "UPDATE threads SET has_user_event = 1 WHERE id = ?1 AND COALESCE(has_user_event, 0) <> 1",
                 [thread_id],
@@ -2068,6 +3002,9 @@ fn apply_sqlite_update(
     }
     if columns.contains("cwd") {
         for (thread_id, cwd) in cwd_by_thread_id {
+            if excluded_thread_ids.contains(thread_id) {
+                continue;
+            }
             counts.cwd_rows += tx.execute(
                 "UPDATE threads SET cwd = ?1 WHERE id = ?2 AND COALESCE(cwd, '') <> ?1",
                 (cwd, thread_id),
@@ -2083,6 +3020,7 @@ fn apply_sqlite_update_for_paths(
     target_provider: &str,
     user_event_thread_ids: &HashSet<String>,
     cwd_by_thread_id: &HashMap<String, String>,
+    excluded_thread_ids: &HashSet<String>,
 ) -> anyhow::Result<SqliteUpdateCounts> {
     let mut total = SqliteUpdateCounts::default();
     for path in paths {
@@ -2091,6 +3029,7 @@ fn apply_sqlite_update_for_paths(
             target_provider,
             user_event_thread_ids,
             cwd_by_thread_id,
+            excluded_thread_ids,
         )?);
     }
     Ok(total)
@@ -2211,12 +3150,13 @@ fn apply_remote_control_catalog_updates(
     Ok(total)
 }
 
-fn count_missing_local_thread_catalog_rows(
+fn count_local_thread_catalog_repairs(
+    home: &Path,
     paths: &[PathBuf],
     target_provider: &str,
 ) -> anyhow::Result<usize> {
-    let source_threads = collect_catalog_repair_threads(paths, target_provider, None)?;
-    if source_threads.is_empty() {
+    let plan = collect_catalog_repair_plan(home, paths, target_provider, None)?;
+    if plan.threads.is_empty() && !plan.has_cleanup_candidates() {
         return Ok(0);
     }
     let mut total = 0;
@@ -2232,8 +3172,13 @@ fn count_missing_local_thread_catalog_rows(
         let Some(host_id) = local_catalog_host_id(&db)? else {
             continue;
         };
-        for thread in source_threads.values() {
+        for thread in plan.threads.values() {
             if !local_catalog_contains_thread(&db, &host_id, &thread.id)? {
+                total += 1;
+            }
+        }
+        for thread_id in plan.cleanup_thread_ids_for_path(path) {
+            if local_catalog_contains_thread(&db, &host_id, &thread_id)? {
                 total += 1;
             }
         }
@@ -2242,18 +3187,21 @@ fn count_missing_local_thread_catalog_rows(
 }
 
 fn repair_missing_local_thread_catalog_rows(
+    home: &Path,
     paths: &[PathBuf],
     target_provider: &str,
-) -> anyhow::Result<usize> {
-    repair_missing_local_thread_catalog_rows_filtered(paths, target_provider, None, true)
+) -> anyhow::Result<CatalogRepairCounts> {
+    repair_missing_local_thread_catalog_rows_filtered(home, paths, target_provider, None, true)
 }
 
 fn repair_missing_local_thread_catalog_rows_for_threads(
+    home: &Path,
     paths: &[PathBuf],
     target_provider: &str,
     thread_ids: &HashSet<String>,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<CatalogRepairCounts> {
     repair_missing_local_thread_catalog_rows_filtered(
+        home,
         paths,
         target_provider,
         Some(thread_ids),
@@ -2262,16 +3210,19 @@ fn repair_missing_local_thread_catalog_rows_for_threads(
 }
 
 fn repair_missing_local_thread_catalog_rows_filtered(
+    home: &Path,
     paths: &[PathBuf],
     target_provider: &str,
     thread_ids: Option<&HashSet<String>>,
     update_full_sync_state: bool,
-) -> anyhow::Result<usize> {
-    let source_threads = collect_catalog_repair_threads(paths, target_provider, thread_ids)?;
-    if source_threads.is_empty() {
-        return Ok(0);
+) -> anyhow::Result<CatalogRepairCounts> {
+    let plan = collect_catalog_repair_plan(home, paths, target_provider, thread_ids)?;
+    if plan.threads.is_empty()
+        && (!update_full_sync_state || !plan.has_cleanup_candidates())
+    {
+        return Ok(CatalogRepairCounts::default());
     }
-    let mut total_inserted = 0;
+    let mut total = CatalogRepairCounts::default();
     for path in paths {
         if !path.exists() {
             continue;
@@ -2297,26 +3248,41 @@ fn repair_missing_local_thread_catalog_rows_filtered(
             placeholders
         );
         let tx = db.transaction()?;
+        let mut removed = 0;
+        if update_full_sync_state {
+            let cleanup_thread_ids = plan.cleanup_thread_ids_for_path(path);
+            let mut non_root_thread_ids = cleanup_thread_ids.iter().collect::<Vec<_>>();
+            non_root_thread_ids.sort();
+            let mut delete = tx.prepare(
+                "DELETE FROM local_thread_catalog WHERE host_id = ?1 AND thread_id = ?2",
+            )?;
+            for thread_id in non_root_thread_ids {
+                removed += delete.execute((&host_id, thread_id))?;
+            }
+            drop(delete);
+        }
         let mut inserted = 0;
         let mut max_source_updated_at = 0.0_f64;
-        let mut threads = source_threads.values().collect::<Vec<_>>();
+        let mut threads = plan.threads.values().collect::<Vec<_>>();
         threads.sort_by(|left, right| left.id.cmp(&right.id));
         for thread in threads {
-            observation_sequence += 1;
+            let next_observation_sequence = observation_sequence + 1;
             let values = local_catalog_insert_values(
                 &insert_columns,
                 &host_id,
                 thread,
-                observation_sequence,
+                next_observation_sequence,
             );
             let affected = tx.execute(&insert_sql, params_from_iter(values))?;
             if affected > 0 {
+                observation_sequence = next_observation_sequence;
                 inserted += affected;
                 max_source_updated_at = max_source_updated_at.max(thread.source_updated_at);
             }
         }
-        if inserted > 0 {
-            update_local_catalog_metadata(&tx, &metadata_columns, inserted)?;
+        let changed = inserted + removed;
+        if changed > 0 {
+            update_local_catalog_metadata(&tx, &metadata_columns, changed)?;
             if update_full_sync_state {
                 update_local_catalog_sync_state(
                     &tx,
@@ -2328,17 +3294,24 @@ fn repair_missing_local_thread_catalog_rows_filtered(
             }
         }
         tx.commit()?;
-        total_inserted += inserted;
+        total.add(CatalogRepairCounts {
+            inserted_rows: inserted,
+            removed_rows: removed,
+        });
     }
-    Ok(total_inserted)
+    Ok(total)
 }
 
-fn collect_catalog_repair_threads(
+fn collect_catalog_repair_plan(
+    home: &Path,
     paths: &[PathBuf],
     target_provider: &str,
     thread_ids: Option<&HashSet<String>>,
-) -> anyhow::Result<HashMap<String, CatalogRepairThread>> {
-    let mut threads = HashMap::new();
+) -> anyhow::Result<CatalogRepairPlan> {
+    let spawned_child_ids = collect_spawned_child_thread_ids(paths)?;
+    let mut catalog_non_root_thread_ids =
+        collect_catalog_marked_non_root_thread_ids(paths, &spawned_child_ids)?;
+    let mut observed_threads = HashMap::new();
     for path in paths {
         if !path.exists() {
             continue;
@@ -2360,43 +3333,279 @@ fn collect_catalog_repair_threads(
         let source_detail = text_expr(&columns, "rollout_path", "''");
         let git_branch = text_expr(&columns, "git_branch", "NULL");
         let thread_source = text_expr(&columns, "thread_source", "NULL");
+        let archived = text_expr(&columns, "archived", "0");
+        let has_user_event = text_expr(&columns, "has_user_event", "1");
+        let agent_role = text_expr(&columns, "agent_role", "''");
+        let subagent_filter = subagent_filter(&db, "threads.id")?;
         let sql = format!(
-            "SELECT id, {display_title}, {source_created_at}, {source_updated_at}, {cwd}, {source_kind}, {source_detail}, {git_branch}, {thread_source} FROM threads WHERE COALESCE(id, '') <> ''"
+            "SELECT id, {display_title}, {source_created_at}, {source_updated_at}, {cwd}, {source_kind}, {source_detail}, {git_branch}, {thread_source}, {archived}, {has_user_event}, {agent_role} FROM threads WHERE COALESCE(id, '') <> ''{subagent_filter}"
         );
         let mut stmt = db.prepare(&sql)?;
         let rows = stmt.query_map([], |row| {
-            Ok(CatalogRepairThread {
-                id: row.get(0)?,
-                display_title: row.get::<_, String>(1).unwrap_or_default(),
-                source_created_at: row.get::<_, f64>(2).unwrap_or_default(),
-                source_updated_at: row.get::<_, f64>(3).unwrap_or_default(),
-                cwd: row.get::<_, String>(4).unwrap_or_default(),
-                source_kind: row
-                    .get::<_, String>(5)
-                    .unwrap_or_else(|_| "cli".to_string()),
-                source_detail: row.get::<_, String>(6).unwrap_or_default(),
-                model_provider: target_provider.to_string(),
-                git_branch: row.get::<_, Option<String>>(7).unwrap_or(None),
-                thread_source: row.get::<_, Option<String>>(8).unwrap_or(None),
-            })
+            Ok((
+                CatalogRepairThread {
+                    id: row.get(0)?,
+                    display_title: row.get::<_, String>(1).unwrap_or_default(),
+                    source_created_at: row.get::<_, f64>(2).unwrap_or_default(),
+                    source_updated_at: row.get::<_, f64>(3).unwrap_or_default(),
+                    cwd: row.get::<_, String>(4).unwrap_or_default(),
+                    source_kind: row
+                        .get::<_, String>(5)
+                        .unwrap_or_else(|_| "cli".to_string()),
+                    source_detail: row.get::<_, String>(6).unwrap_or_default(),
+                    model_provider: target_provider.to_string(),
+                    git_branch: row.get::<_, Option<String>>(7).unwrap_or(None),
+                    thread_source: row.get::<_, Option<String>>(8).unwrap_or(None),
+                },
+                row.get::<_, i64>(9).unwrap_or_default(),
+                row.get::<_, i64>(10).unwrap_or(1),
+                row.get::<_, String>(11).unwrap_or_default(),
+            ))
         })?;
         for item in rows {
-            let thread = item?;
-            if thread_ids.is_some_and(|thread_ids| !thread_ids.contains(&thread.id)) {
-                continue;
-            }
-            let replace = threads
+            let (thread, archived, has_user_event, agent_role) = item?;
+            let marked_non_user = columns.contains("thread_source")
+                && thread.thread_source.as_deref().is_some_and(|value| {
+                    let value = value.trim();
+                    !value.is_empty() && !value.eq_ignore_ascii_case("user")
+                });
+            let non_root = is_catalog_non_root_agent(&thread, &spawned_child_ids);
+            let source_is_exec = thread.source_kind.trim().eq_ignore_ascii_case("exec");
+            let rollout_exists = catalog_rollout_path_exists(home, &thread.source_detail);
+            let eligible = archived == 0
+                && has_user_event == 1
+                && agent_role.trim().is_empty()
+                && !marked_non_user
+                && !source_is_exec
+                && !non_root
+                && rollout_exists;
+            let replace = observed_threads
                 .get(&thread.id)
-                .map(|current: &CatalogRepairThread| {
-                    thread.source_updated_at > current.source_updated_at
+                .map(|current: &CatalogRepairObservedThread| {
+                    // Copies can share a timestamp; an ineligible observation wins the tie so
+                    // an archived or agent-owned thread cannot be resurrected by a stale copy.
+                    thread.source_updated_at > current.thread.source_updated_at
+                        || (thread.source_updated_at == current.thread.source_updated_at
+                            && !eligible
+                            && current.eligible)
                 })
                 .unwrap_or(true);
             if replace {
-                threads.insert(thread.id.clone(), thread);
+                observed_threads.insert(
+                    thread.id.clone(),
+                    CatalogRepairObservedThread { thread, eligible },
+                );
             }
         }
     }
-    Ok(threads)
+    if let Some(thread_ids) = thread_ids {
+        observed_threads.retain(|thread_id, _| thread_ids.contains(thread_id));
+    }
+    let explicit_user_thread_ids = observed_threads
+        .values()
+        .filter(|observed| thread_source_is_user(observed.thread.thread_source.as_deref()))
+        .map(|observed| observed.thread.id.clone())
+        .collect::<HashSet<_>>();
+    let non_root_thread_ids = observed_threads
+        .values()
+        .filter(|observed| is_catalog_non_root_agent(&observed.thread, &spawned_child_ids))
+        .map(|observed| observed.thread.id.clone())
+        .collect::<HashSet<_>>();
+    let ineligible_thread_ids = observed_threads
+        .values()
+        .filter(|observed| !observed.eligible)
+        .map(|observed| observed.thread.id.clone())
+        .collect::<HashSet<_>>();
+    let threads = observed_threads
+        .into_iter()
+        .filter_map(|(thread_id, observed)| {
+            observed.eligible.then_some((thread_id, observed.thread))
+        })
+        .collect::<HashMap<_, _>>();
+    // Catalog-only evidence stays path-scoped so one stale database cannot remove another's row.
+    for catalog_thread_ids in catalog_non_root_thread_ids.values_mut() {
+        catalog_thread_ids.retain(|thread_id| {
+            thread_ids
+                .map(|requested| requested.contains(thread_id))
+                .unwrap_or(true)
+                && !explicit_user_thread_ids.contains(thread_id)
+        });
+    }
+    catalog_non_root_thread_ids.retain(|_, thread_ids| !thread_ids.is_empty());
+    Ok(CatalogRepairPlan {
+        threads,
+        non_root_thread_ids,
+        ineligible_thread_ids,
+        catalog_non_root_thread_ids,
+    })
+}
+
+fn catalog_rollout_path_exists(home: &Path, rollout_path: &str) -> bool {
+    let rollout_path = rollout_path.trim();
+    if rollout_path.is_empty() {
+        return true;
+    }
+    let rollout_path = Path::new(rollout_path);
+    if rollout_path.is_absolute() {
+        rollout_path.is_file()
+    } else {
+        home.join(rollout_path).is_file()
+    }
+}
+
+fn collect_spawned_child_thread_ids(paths: &[PathBuf]) -> anyhow::Result<HashSet<String>> {
+    let mut thread_ids = HashSet::new();
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        let db = Connection::open(path)?;
+        let columns = table_columns(&db, "thread_spawn_edges")?;
+        if !columns.contains("child_thread_id") {
+            continue;
+        }
+        let mut stmt = db.prepare(
+            "SELECT child_thread_id FROM thread_spawn_edges WHERE COALESCE(child_thread_id, '') <> ''",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        for thread_id in rows {
+            thread_ids.insert(thread_id?);
+        }
+    }
+    Ok(thread_ids)
+}
+
+fn collect_catalog_marked_non_root_thread_ids(
+    paths: &[PathBuf],
+    spawned_child_ids: &HashSet<String>,
+) -> anyhow::Result<HashMap<PathBuf, HashSet<String>>> {
+    let mut thread_ids_by_path: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        let db = Connection::open(path)?;
+        let columns = table_columns(&db, "local_thread_catalog")?;
+        if !columns.contains("host_id") || !columns.contains("thread_id") {
+            continue;
+        }
+        let Some(host_id) = local_catalog_host_id(&db)? else {
+            continue;
+        };
+        let source_kind = text_expr(&columns, "source_kind", "''");
+        let thread_source = text_expr(&columns, "thread_source", "NULL");
+        let sql = format!(
+            "SELECT thread_id, {source_kind}, {thread_source} FROM local_thread_catalog WHERE host_id = ?1 AND COALESCE(thread_id, '') <> ''"
+        );
+        let mut stmt = db.prepare(&sql)?;
+        let rows = stmt.query_map([host_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1).unwrap_or_default(),
+                row.get::<_, Option<String>>(2).unwrap_or(None),
+            ))
+        })?;
+        for row in rows {
+            let (thread_id, source_kind, thread_source) = row?;
+            if source_structured_marks_non_root_agent(&source_kind)
+                || thread_source_marks_non_root(thread_source.as_deref())
+            {
+                thread_ids_by_path
+                    .entry(path.clone())
+                    .or_default()
+                    .insert(thread_id);
+                continue;
+            }
+            if thread_source_is_user(thread_source.as_deref()) {
+                continue;
+            }
+            if source_marks_non_root_agent(&source_kind) || spawned_child_ids.contains(&thread_id)
+            {
+                thread_ids_by_path
+                    .entry(path.clone())
+                    .or_default()
+                    .insert(thread_id);
+            }
+        }
+    }
+    Ok(thread_ids_by_path)
+}
+
+fn is_catalog_non_root_agent(
+    thread: &CatalogRepairThread,
+    spawned_child_ids: &HashSet<String>,
+) -> bool {
+    if source_structured_marks_non_root_agent(&thread.source_kind)
+        || thread_source_marks_non_root(thread.thread_source.as_deref())
+    {
+        return true;
+    }
+    // The explicit user marker is authoritative over legacy text and spawn-edge fallbacks.
+    if thread_source_is_user(thread.thread_source.as_deref()) {
+        return false;
+    }
+    source_marks_non_root_agent(&thread.source_kind)
+        || spawned_child_ids.contains(&thread.id)
+}
+
+fn thread_source_is_user(thread_source: Option<&str>) -> bool {
+    thread_source
+        .map(str::trim)
+        .is_some_and(|value| value.eq_ignore_ascii_case("user"))
+}
+
+fn thread_source_marks_non_root(thread_source: Option<&str>) -> bool {
+    thread_source.map(str::trim).is_some_and(|value| {
+        value.eq_ignore_ascii_case("subagent")
+            || value.eq_ignore_ascii_case("memory_consolidation")
+    })
+}
+
+fn source_marks_non_root_agent(source: &str) -> bool {
+    let source = source.trim();
+    if source_text_marks_non_root_agent(source) {
+        return true;
+    }
+    source_structured_marks_non_root_agent(source)
+}
+
+fn source_structured_marks_non_root_agent(source: &str) -> bool {
+    serde_json::from_str::<Value>(source.trim())
+        .is_ok_and(|source| source_value_marks_non_root_agent(&source))
+}
+
+fn source_value_marks_non_root_agent(source: &Value) -> bool {
+    match source {
+        // 只看 key 在不在会把 `{"internal": false}`、`{"sub_agent": null}` 这种
+        // 明确表示「不是子代理」的记录判成子代理，而这个判定的下游是 DELETE，
+        // 误判等于真实会话被删。所以要求 value 本身也表示「是」。
+        Value::Object(object) => ["sub_agent", "subagent", "internal"]
+            .iter()
+            .any(|key| object.get(*key).is_some_and(value_asserts_non_root_agent)),
+        Value::String(value) => source_text_marks_non_root_agent(value),
+        _ => false,
+    }
+}
+
+/// 判断标记字段的取值是否真的在声明「这是子代理线程」。
+/// 空对象/空数组同样按「没声明」处理，避免占位字段引发误删。
+fn value_asserts_non_root_agent(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(flag) => *flag,
+        Value::Object(object) => !object.is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        Value::String(text) => !text.trim().is_empty(),
+        Value::Number(_) => true,
+    }
+}
+
+fn source_text_marks_non_root_agent(source: &str) -> bool {
+    let source = source.trim().to_ascii_lowercase();
+    source == "subagent"
+        || source == "internal"
+        || source.starts_with("subagent_")
+        || source.starts_with("internal_")
 }
 
 fn catalog_supports_repair(columns: &HashSet<String>) -> bool {
@@ -2847,4 +4056,318 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod non_root_agent_tests {
+    use super::*;
+
+    fn marks_non_root(source: &str) -> bool {
+        source_structured_marks_non_root_agent(source)
+    }
+
+    #[test]
+    fn structured_subagent_markers_still_identify_child_threads() {
+        assert!(marks_non_root(r#"{"subagent":{"thread_spawn":{"depth":1}}}"#));
+        assert!(marks_non_root(r#"{"sub_agent":{"other":"review"}}"#));
+        assert!(marks_non_root(r#"{"internal":true}"#));
+    }
+
+    /// 这些取值明确表示「不是子代理」。判定的下游是 DELETE，
+    /// 按 key 存在就算数会把真实会话删掉（issue #1948）。
+    #[test]
+    fn markers_that_explicitly_deny_being_a_subagent_do_not_count() {
+        assert!(!marks_non_root(r#"{"internal":false}"#));
+        assert!(!marks_non_root(r#"{"sub_agent":null}"#));
+        assert!(!marks_non_root(r#"{"subagent":false}"#));
+    }
+
+    /// 占位字段（空对象/空串）同样不构成声明。
+    #[test]
+    fn empty_placeholder_markers_do_not_count() {
+        assert!(!marks_non_root(r#"{"subagent":{}}"#));
+        assert!(!marks_non_root(r#"{"sub_agent":[]}"#));
+        assert!(!marks_non_root(r#"{"internal":"  "}"#));
+    }
+
+    #[test]
+    fn unrelated_or_malformed_sources_are_left_alone() {
+        assert!(!marks_non_root(r#"{"origin":"subagent"}"#));
+        assert!(!marks_non_root(r#"{"sub_agent":"#));
+        assert!(!marks_non_root("cli"));
+    }
+}
+
+#[cfg(test)]
+mod lock_state_tests {
+    use super::*;
+    use codex_plus_core::watcher::ProcessInstanceState;
+
+    fn owner(pid: u32) -> ProviderSyncLockOwner {
+        ProviderSyncLockOwner {
+            pid,
+            started_at: 1234,
+            process_started_at: Some(1200),
+            process_birth_id: Some("birth-1200".to_string()),
+            lock_id: Some("lock-1".to_string()),
+        }
+    }
+
+    fn running(started_at_secs: Option<u64>) -> ProcessInstanceState {
+        ProcessInstanceState::Running {
+            started_at_secs,
+            birth_id: started_at_secs.map(|started_at| format!("birth-{started_at}")),
+        }
+    }
+
+    #[test]
+    fn live_owner_counts_as_held() {
+        let state = classify_lock(Some(&owner(42)), Some(0), |_| running(Some(1200)));
+
+        assert_eq!(
+            state,
+            ProviderSyncLockState::Held {
+                pid: 42,
+                started_at: 1234
+            }
+        );
+    }
+
+    #[test]
+    fn dead_owner_counts_as_stale() {
+        let state = classify_lock(Some(&owner(42)), Some(0), |_| {
+            ProcessInstanceState::NotRunning
+        });
+
+        assert_eq!(state, ProviderSyncLockState::Stale { pid: Some(42) });
+    }
+
+    #[test]
+    fn reused_pid_with_a_different_process_start_is_stale() {
+        let state = classify_lock(Some(&owner(42)), Some(9_999), |_| running(Some(5000)));
+
+        assert_eq!(state, ProviderSyncLockState::Stale { pid: Some(42) });
+    }
+
+    #[test]
+    fn matching_birth_id_tolerates_approximate_unix_start_time_drift() {
+        let state = classify_lock(Some(&owner(42)), Some(0), |_| {
+            ProcessInstanceState::Running {
+                started_at_secs: Some(1201),
+                birth_id: Some("birth-1200".to_string()),
+            }
+        });
+
+        assert_eq!(
+            state,
+            ProviderSyncLockState::Held {
+                pid: 42,
+                started_at: 1234
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_owner_with_a_much_newer_process_is_stale() {
+        let legacy_owner = ProviderSyncLockOwner {
+            process_started_at: None,
+            process_birth_id: None,
+            lock_id: None,
+            ..owner(42)
+        };
+        let state = classify_lock(
+            Some(&legacy_owner),
+            Some(LEGACY_PID_REUSE_MIN_LOCK_AGE_SECS),
+            |_| {
+                running(Some(
+                    legacy_owner.started_at + LEGACY_PID_REUSE_TOLERANCE_SECS + 1,
+                ))
+            },
+        );
+
+        assert_eq!(state, ProviderSyncLockState::Stale { pid: Some(42) });
+    }
+
+    #[test]
+    fn legacy_owner_keeps_a_process_started_before_the_lock() {
+        let legacy_owner = ProviderSyncLockOwner {
+            process_started_at: None,
+            process_birth_id: None,
+            lock_id: None,
+            ..owner(42)
+        };
+        let state = classify_lock(Some(&legacy_owner), Some(9_999), |_| {
+            running(Some(legacy_owner.started_at - 1))
+        });
+
+        assert_eq!(
+            state,
+            ProviderSyncLockState::Held {
+                pid: 42,
+                started_at: 1234
+            }
+        );
+    }
+
+    #[test]
+    fn recent_legacy_lock_remains_held_even_if_wall_clock_evidence_looks_newer() {
+        let legacy_owner = ProviderSyncLockOwner {
+            process_started_at: None,
+            process_birth_id: None,
+            lock_id: None,
+            ..owner(42)
+        };
+        let state = classify_lock(
+            Some(&legacy_owner),
+            Some(LEGACY_PID_REUSE_MIN_LOCK_AGE_SECS - 1),
+            |_| {
+                running(Some(
+                    legacy_owner.started_at + LEGACY_PID_REUSE_TOLERANCE_SECS + 1,
+                ))
+            },
+        );
+
+        assert_eq!(
+            state,
+            ProviderSyncLockState::Held {
+                pid: 42,
+                started_at: 1234
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_process_identity_is_treated_as_held_rather_than_stolen() {
+        let state = classify_lock(Some(&owner(42)), Some(9_999), |_| {
+            ProcessInstanceState::Unknown
+        });
+
+        assert_eq!(
+            state,
+            ProviderSyncLockState::Held {
+                pid: 42,
+                started_at: 1234
+            }
+        );
+    }
+
+    #[test]
+    fn aged_lock_without_owner_is_recoverable_interrupted_leftover() {
+        let state = classify_lock(None, Some(LOCK_INTERRUPTED_GRACE_SECS), |_| {
+            running(Some(1200))
+        });
+
+        assert_eq!(state, ProviderSyncLockState::Stale { pid: None });
+    }
+
+    #[test]
+    fn fresh_lock_without_owner_is_left_alone_for_the_process_still_creating_it() {
+        let state = classify_lock(None, Some(LOCK_INTERRUPTED_GRACE_SECS - 1), |_| {
+            running(Some(1200))
+        });
+
+        assert_eq!(state, ProviderSyncLockState::Indeterminate);
+    }
+
+    #[test]
+    fn unreadable_lock_age_is_left_alone() {
+        let state = classify_lock(None, None, |_| running(Some(1200)));
+
+        assert_eq!(state, ProviderSyncLockState::Indeterminate);
+    }
+
+    #[test]
+    fn legacy_owner_json_remains_compatible() {
+        let owner: ProviderSyncLockOwner =
+            serde_json::from_str(r#"{"pid":42,"startedAt":1234}"#).unwrap();
+
+        assert_eq!(owner.pid, 42);
+        assert_eq!(owner.started_at, 1234);
+        assert_eq!(owner.process_started_at, None);
+        assert_eq!(owner.process_birth_id, None);
+        assert_eq!(owner.lock_id, None);
+    }
+
+    #[test]
+    fn lifecycle_guard_serializes_and_releases_the_legacy_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_dir = temp.path().join("tmp/provider-sync.lock");
+        let first = acquire_lock_inner(&lock_dir, false).unwrap();
+
+        assert!(lock_dir.join("owner.json").is_file());
+        let error = acquire_lock_inner(&lock_dir, false).unwrap_err();
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::WouldBlock
+            ),
+            "unexpected lock contention error: {error:?}; raw={:?}",
+            error.raw_os_error()
+        );
+
+        drop(first);
+        assert!(!lock_dir.exists());
+        let second = acquire_lock_inner(&lock_dir, false).unwrap();
+        drop(second);
+        assert!(!lock_dir.exists());
+    }
+
+    #[test]
+    fn a_guard_cannot_remove_a_directory_owned_by_another_lock_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_dir = temp.path().join("tmp/provider-sync.lock");
+        let guard = acquire_lock_inner(&lock_dir, false).unwrap();
+
+        assert!(!release_owned_lock(&lock_dir, "not-the-owner").unwrap());
+        assert!(lock_dir.join("owner.json").is_file());
+
+        drop(guard);
+        assert!(!lock_dir.exists());
+    }
+
+    #[test]
+    fn explicit_release_rejects_changed_directory_ownership() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_dir = temp.path().join("tmp/provider-sync.lock");
+        let guard = acquire_lock_inner(&lock_dir, false).unwrap();
+        fs::write(
+            lock_dir.join("owner.json"),
+            json!({
+                "pid": std::process::id(),
+                "startedAt": now_secs(),
+                "lockId": "replacement-owner",
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let error = guard.release().unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(lock_dir.exists());
+    }
+
+    #[test]
+    fn os_lock_authoritatively_recovers_an_orphaned_new_protocol_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_dir = temp.path().join("tmp/provider-sync.lock");
+        let guard = acquire_lock_inner(&lock_dir, false).unwrap();
+        fs::write(
+            lock_dir.join("owner.json"),
+            json!({
+                "pid": std::process::id(),
+                "startedAt": now_secs(),
+                "lockId": "orphaned-owner",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        drop(guard);
+        assert!(lock_dir.exists());
+
+        let recovered = acquire_lock_inner(&lock_dir, false).unwrap();
+        recovered.release().unwrap();
+
+        assert!(!lock_dir.exists());
+    }
 }
