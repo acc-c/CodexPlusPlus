@@ -1,10 +1,6 @@
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -14,13 +10,13 @@ use serde_json::{Value, json};
 use crate::models::{DeleteResult, DeleteStatus, ExportResult, ExportStatus, SessionRef};
 use crate::settings::{BackendSettings, SettingsStore};
 use crate::status::StatusStore;
+use crate::taskboard_runtime::{
+    TASKBOARD_URL, spawn_taskboard_service, taskboard_health_ok, wait_for_taskboard_health,
+};
 use crate::user_scripts::UserScriptManager;
 
 pub type UserScriptEvaluator = Arc<dyn Fn(&str, &str) -> anyhow::Result<Value> + Send + Sync>;
 pub type DevtoolsOpener = Arc<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync>;
-
-const TASKBOARD_PORT: u16 = 47823;
-const TASKBOARD_URL: &str = "http://127.0.0.1:47823/?host=codex";
 
 #[derive(Clone)]
 pub struct BridgeContext {
@@ -374,64 +370,6 @@ fn taskboard_response(
         "alreadyRunning": already_running,
         "launched": launched
     })
-}
-
-fn wait_for_taskboard_health(timeout: Duration) -> bool {
-    let started_at = Instant::now();
-    while started_at.elapsed() < timeout {
-        if taskboard_health_ok() {
-            return true;
-        }
-        thread::sleep(Duration::from_millis(250));
-    }
-    false
-}
-
-fn taskboard_health_ok() -> bool {
-    let address = SocketAddr::from(([127, 0, 0, 1], TASKBOARD_PORT));
-    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(250)) else {
-        return false;
-    };
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(750)));
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(750)));
-    if stream
-        .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1:47823\r\nConnection: close\r\n\r\n")
-        .is_err()
-    {
-        return false;
-    }
-    let mut response = String::new();
-    stream.read_to_string(&mut response).is_ok()
-        && response.contains(" 200 ")
-        && response.contains("\"status\":\"ok\"")
-}
-
-fn spawn_taskboard_service() -> anyhow::Result<()> {
-    let mut command = taskboard_start_command();
-    command.env("CODEX_TASKBOARD_HOST", "127.0.0.1");
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(crate::windows_create_no_window());
-    }
-    command.spawn()?;
-    Ok(())
-}
-
-#[cfg(target_os = "windows")]
-fn taskboard_start_command() -> Command {
-    let mut command = Command::new("cmd");
-    command.args(["/C", "codex-taskboard"]);
-    command
-}
-
-#[cfg(not(target_os = "windows"))]
-fn taskboard_start_command() -> Command {
-    Command::new("codex-taskboard")
 }
 
 #[async_trait]

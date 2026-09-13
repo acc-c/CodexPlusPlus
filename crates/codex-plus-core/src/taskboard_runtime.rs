@@ -5,6 +5,8 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use base64::{Engine as _, engine::general_purpose};
+
 pub const TASKBOARD_PORT: u16 = 47823;
 pub const TASKBOARD_URL: &str = "http://127.0.0.1:47823/?host=codex";
 const TASKBOARD_HOST_ENV: &str = "CODEX_TASKBOARD_HOST";
@@ -26,10 +28,9 @@ fn taskboard_requested_host() -> Option<String> {
 }
 
 fn taskboard_shared_secret() -> Option<String> {
-    match std::env::var(TASKBOARD_SHARED_SECRET_ENV) {
-        Ok(secret) if !secret.is_empty() => Some(secret),
-        _ => None,
-    }
+    let secret = std::env::var(TASKBOARD_SHARED_SECRET_ENV).ok()?;
+    let secret = secret.trim();
+    (!secret.is_empty()).then(|| secret.to_string())
 }
 
 fn taskboard_lan_sharing_enabled() -> bool {
@@ -66,15 +67,25 @@ pub fn taskboard_health_ok() -> bool {
     };
     let _ = stream.set_read_timeout(Some(Duration::from_millis(750)));
     let _ = stream.set_write_timeout(Some(Duration::from_millis(750)));
-    if stream
-        .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1:47823\r\nConnection: close\r\n\r\n")
-        .is_err()
-    {
+    let request = taskboard_health_request(taskboard_shared_secret().as_deref());
+    if stream.write_all(request.as_bytes()).is_err() {
         return false;
     }
     let mut response = String::new();
     stream.read_to_string(&mut response).is_ok()
         && taskboard_health_response_matches(&response, taskboard_expected_host())
+}
+
+fn taskboard_health_request(shared_secret: Option<&str>) -> String {
+    let authorization = shared_secret
+        .map(|secret| {
+            let token = general_purpose::STANDARD.encode(format!("codex:{secret}"));
+            format!("Authorization: Basic {token}\r\n")
+        })
+        .unwrap_or_default();
+    format!(
+        "GET /health HTTP/1.1\r\nHost: 127.0.0.1:47823\r\n{authorization}Connection: close\r\n\r\n"
+    )
 }
 
 fn taskboard_health_response_matches(response: &str, expected_host: &str) -> bool {
@@ -133,16 +144,12 @@ fn taskboard_service_command(root: Option<&Path>) -> Command {
         command
             .current_dir(root)
             .arg(root.join("server").join("index.mjs"));
-        if taskboard_requested_host().is_none() {
-            command.env(TASKBOARD_HOST_ENV, LOOPBACK_TASKBOARD_HOST);
-        }
+        command.env(TASKBOARD_HOST_ENV, taskboard_expected_host());
         return command;
     }
 
     let mut command = taskboard_cli_command();
-    if taskboard_requested_host().is_none() {
-        command.env(TASKBOARD_HOST_ENV, LOOPBACK_TASKBOARD_HOST);
-    }
+    command.env(TASKBOARD_HOST_ENV, taskboard_expected_host());
     command
 }
 
@@ -291,7 +298,10 @@ mod tests {
         let previous_secret = std::env::var(TASKBOARD_SHARED_SECRET_ENV).ok();
         clear_taskboard_env();
 
-        let command = taskboard_service_command(None);
+        let test_dir = tempfile::tempdir().unwrap();
+        let root = test_dir.path().join("codex-taskboard");
+        touch_runtime(&root);
+        let command = taskboard_service_command(Some(&root));
         let envs = command.get_envs().collect::<Vec<_>>();
 
         assert!(envs.iter().any(|(name, value)| {
@@ -340,6 +350,13 @@ mod tests {
             lan_response,
             LAN_TASKBOARD_HOST
         ));
+    }
+
+    #[test]
+    fn lan_health_request_carries_shared_secret_authentication() {
+        let request = taskboard_health_request(Some("test-secret"));
+        assert!(request.contains("Authorization: Basic Y29kZXg6dGVzdC1zZWNyZXQ="));
+        assert!(!taskboard_health_request(None).contains("Authorization:"));
     }
 
     fn taskboard_env_lock() -> std::sync::MutexGuard<'static, ()> {

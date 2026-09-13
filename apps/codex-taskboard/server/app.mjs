@@ -1,5 +1,5 @@
-import { randomUUID } from "node:crypto";
-import { execFile, spawn } from "node:child_process";
+import { randomUUID, timingSafeEqual } from "node:crypto";
+import { execFile } from "node:child_process";
 import { mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { isIP } from "node:net";
@@ -17,6 +17,7 @@ import {
 } from "../shared/domain.mjs";
 import { normalizeWorkflowSnapshot } from "../shared/workflow-control-flow.mjs";
 import { AiChatService } from "./ai-chat.mjs";
+import { execFileExecutable, spawnExecutable } from "./executable.mjs";
 import { createCloudConfigStore } from "./cloud-config.mjs";
 import {
   CloudProxyError,
@@ -43,6 +44,12 @@ const INLINE_ATTACHMENT_TYPES = new Set([
 ]);
 const PROJECT_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 const TRUSTED_EMBED_ORIGINS = new Set(["app://-"]);
+const LOOPBACK_TASKBOARD_HOST = "127.0.0.1";
+const LAN_TASKBOARD_HOST = "0.0.0.0";
+const TASKBOARD_SHARED_SECRET_ENV = "TASKBOARD_SHARED_SECRET";
+const TASKBOARD_BIND_HOST_HEADER = "x-taskboard-bind-host";
+export const LAN_SHARING_WARNING =
+  "LAN sharing is enabled; requests require Basic auth and same-origin protection.";
 const CODEX_AGENT_ACTOR = {
   type: "agent",
   id: "codex-agent",
@@ -163,19 +170,20 @@ function isTrustedNetworkHost(hostname) {
 }
 
 function assertTrustedNetworkRequest(request) {
-  let host;
+  let requestUrl;
   try {
-    host = new URL(`http://${request.headers.host ?? ""}`).hostname;
+    requestUrl = new URL(`http://${request.headers.host ?? ""}`);
   } catch {
     throw new ApiError(403, "INVALID_HOST", "Request Host must be local or private");
   }
+  const host = requestUrl.hostname;
   if (!isTrustedNetworkHost(host)) {
     throw new ApiError(403, "INVALID_HOST", "Request Host must be local or private");
   }
 
   const origin = request.headers.origin;
-  if (!origin) return;
-  if (TRUSTED_EMBED_ORIGINS.has(origin)) return;
+  if (!origin) return requestUrl.host;
+  if (TRUSTED_EMBED_ORIGINS.has(origin)) return requestUrl.host;
   let originHost;
   try {
     originHost = new URL(origin).hostname;
@@ -184,6 +192,66 @@ function assertTrustedNetworkRequest(request) {
   }
   if (!isTrustedNetworkHost(originHost)) {
     throw new ApiError(403, "INVALID_ORIGIN", "Request Origin must be local or private");
+  }
+  return requestUrl.host;
+}
+
+function assertLanSameOriginRequest(request, requestAuthority) {
+  const origin = request.headers.origin;
+  if (!origin || TRUSTED_EMBED_ORIGINS.has(origin)) return;
+  let originUrl;
+  try {
+    originUrl = new URL(origin);
+  } catch {
+    throw new ApiError(403, "INVALID_ORIGIN", "Request Origin must be local or private");
+  }
+  if (originUrl.protocol !== "http:" || originUrl.host !== requestAuthority) {
+    throw new ApiError(403, "INVALID_ORIGIN", "LAN Origin must match the request Host");
+  }
+}
+
+function resolveSharedSecret(value = process.env[TASKBOARD_SHARED_SECRET_ENV]) {
+  const secret = String(value ?? "").trim();
+  return secret.length > 0 ? secret : null;
+}
+
+function basicAuthChallenge() {
+  const error = new ApiError(401, "LAN_AUTH_REQUIRED", "LAN sharing requires valid Basic auth");
+  error.headers = { "www-authenticate": "Basic realm=\"Codex Taskboard\", charset=\"UTF-8\"" };
+  return error;
+}
+
+function parseBasicAuth(value) {
+  if (typeof value !== "string" || !value.toLowerCase().startsWith("basic ")) return null;
+  const encoded = value.slice(6).trim();
+  let decoded;
+  try {
+    decoded = Buffer.from(encoded, "base64").toString("utf8");
+  } catch {
+    return null;
+  }
+  const separator = decoded.indexOf(":");
+  if (separator < 1) return null;
+  return {
+    username: decoded.slice(0, separator),
+    password: decoded.slice(separator + 1),
+  };
+}
+
+function secretEquals(actual, expected) {
+  const actualBytes = Buffer.from(actual);
+  const expectedBytes = Buffer.from(expected);
+  return actualBytes.length === expectedBytes.length
+    && timingSafeEqual(actualBytes, expectedBytes);
+}
+
+function assertLanAuthorization(request, sharedSecret) {
+  if (!sharedSecret) {
+    throw new ApiError(403, "LAN_SECRET_REQUIRED", `${TASKBOARD_SHARED_SECRET_ENV} is required for LAN sharing`);
+  }
+  const credentials = parseBasicAuth(request.headers.authorization);
+  if (!credentials || !secretEquals(credentials.password, sharedSecret)) {
+    throw basicAuthChallenge();
   }
 }
 
@@ -1287,7 +1355,7 @@ async function scanDevelopmentContexts(workspacePath) {
 
 async function discoverSkills(codexExecutable, workspacePath) {
   const entries = await new Promise((resolve, reject) => {
-    const child = spawn(codexExecutable, ["app-server", "--stdio"], {
+    const child = spawnExecutable(codexExecutable, ["app-server", "--stdio"], {
       cwd: workspacePath,
       stdio: ["pipe", "pipe", "ignore"],
     });
@@ -1400,7 +1468,7 @@ async function discoverSkills(codexExecutable, workspacePath) {
 }
 
 async function discoverMcpServers(codexExecutable) {
-  const result = await execFileAsync(codexExecutable, ["mcp", "list", "--json"], {
+  const result = await execFileExecutable(codexExecutable, ["mcp", "list", "--json"], {
     timeout: 8_000,
     maxBuffer: 2 * 1024 * 1024,
   });
@@ -1465,16 +1533,17 @@ export function resolvePort(value = process.env.CODEX_TASKBOARD_PORT ?? "47823")
   return port;
 }
 
-export function resolveHost(value = process.env.CODEX_TASKBOARD_HOST ?? "0.0.0.0") {
+export function resolveHost(value = process.env.CODEX_TASKBOARD_HOST ?? LOOPBACK_TASKBOARD_HOST) {
   const host = String(value).trim();
-  if (host !== "127.0.0.1" && host !== "0.0.0.0") {
-    throw new Error("CODEX_TASKBOARD_HOST must be 127.0.0.1 or 0.0.0.0");
+  if (host !== LOOPBACK_TASKBOARD_HOST && host !== LAN_TASKBOARD_HOST) {
+    throw new Error(`CODEX_TASKBOARD_HOST must be ${LOOPBACK_TASKBOARD_HOST} or ${LAN_TASKBOARD_HOST}`);
   }
   return host;
 }
 
 export function createTaskboardServer(options = {}) {
   const resolved = resolveServerOptions(options);
+  const sharedSecret = resolveSharedSecret(options.sharedSecret);
   const database = new TaskboardDatabase(resolved.databasePath);
   const events = new EventHub();
   const cloudConfig = options.cloudConfigStore ?? createCloudConfigStore({
@@ -1501,12 +1570,17 @@ export function createTaskboardServer(options = {}) {
     manageTaskboardSkillPath: resolved.skillPath,
   });
   const aiEventResponses = new Set();
+  let activeHost = LOOPBACK_TASKBOARD_HOST;
 
   const server = createServer(async (request, response) => {
     response.setHeader("x-content-type-options", "nosniff");
     response.setHeader("referrer-policy", "no-referrer");
     try {
-      assertTrustedNetworkRequest(request);
+      const requestHost = assertTrustedNetworkRequest(request);
+      if (activeHost === LAN_TASKBOARD_HOST) {
+        assertLanSameOriginRequest(request, requestHost);
+        assertLanAuthorization(request, sharedSecret);
+      }
       const url = new URL(request.url, "http://127.0.0.1");
       const pathname = url.pathname;
       const isLocalAiRoute = pathname === "/api/local/ai" || pathname.startsWith("/api/local/ai/");
@@ -1526,7 +1600,9 @@ export function createTaskboardServer(options = {}) {
 
       if (pathname === "/health") {
         if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
-        return sendJson(response, 200, { status: "ok" });
+        return sendJson(response, 200, { status: "ok" }, {
+          [TASKBOARD_BIND_HOST_HEADER]: activeHost,
+        });
       }
 
       if (pathname === "/api/local/cloud-session") {
@@ -2283,7 +2359,7 @@ export function createTaskboardServer(options = {}) {
       if (error instanceof ApiError) {
         const payload = { error: { code: error.code, message: error.message } };
         if (error.details !== undefined) payload.error.details = error.details;
-        sendJson(response, error.status, payload);
+        sendJson(response, error.status, payload, error.headers);
         return;
       }
       if (error instanceof CloudProxyError) {
@@ -2303,10 +2379,14 @@ export function createTaskboardServer(options = {}) {
     aiChat,
     server,
     options: resolved,
-    async listen({ host = "127.0.0.1", port = resolvePort() } = {}) {
-      if (host !== "127.0.0.1" && host !== "0.0.0.0") {
-        throw new Error("Taskboard server must bind to 127.0.0.1 or 0.0.0.0");
+    async listen({ host = LOOPBACK_TASKBOARD_HOST, port = resolvePort() } = {}) {
+      if (host !== LOOPBACK_TASKBOARD_HOST && host !== LAN_TASKBOARD_HOST) {
+        throw new Error(`Taskboard server must bind to ${LOOPBACK_TASKBOARD_HOST} or ${LAN_TASKBOARD_HOST}`);
       }
+      if (host === LAN_TASKBOARD_HOST && !sharedSecret) {
+        throw new Error(`${TASKBOARD_SHARED_SECRET_ENV} is required when CODEX_TASKBOARD_HOST=${LAN_TASKBOARD_HOST}`);
+      }
+      activeHost = host;
       await new Promise((resolve, reject) => {
         const onError = (error) => {
           server.off("listening", onListening);

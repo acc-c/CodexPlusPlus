@@ -9,6 +9,7 @@ import { afterEach, test } from "node:test";
 import { createTaskboardServer } from "../server/index.mjs";
 
 const runningApps = [];
+const LAN_SHARED_SECRET = "test-taskboard-secret";
 
 afterEach(async () => {
   while (runningApps.length > 0) {
@@ -21,7 +22,12 @@ afterEach(async () => {
 async function startServer(configure, listenOptions = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "codex-taskboard-test-"));
   const options = configure ? await configure(directory) : {};
-  const app = createTaskboardServer({ dataDirectory: directory, ...options });
+  const host = listenOptions.host ?? "127.0.0.1";
+  const app = createTaskboardServer({
+    dataDirectory: directory,
+    ...(host === "0.0.0.0" ? { sharedSecret: LAN_SHARED_SECRET } : {}),
+    ...options,
+  });
   const address = await app.listen({ port: 0, ...listenOptions });
   runningApps.push({ app, directory });
   return `http://127.0.0.1:${address.port}`;
@@ -46,14 +52,15 @@ async function request(baseUrl, pathname, options = {}) {
   };
 }
 
-async function requestWithHost(baseUrl, host) {
+async function requestWithHost(baseUrl, host, headers = {}) {
   const target = new URL("/health", baseUrl);
   return new Promise((resolve, reject) => {
-    const outgoing = httpRequest(target, { headers: { host } }, (response) => {
+    const outgoing = httpRequest(target, { headers: { ...headers, host } }, (response) => {
       const chunks = [];
       response.on("data", (chunk) => chunks.push(chunk));
       response.on("end", () => resolve({
         status: response.statusCode,
+        headers: response.headers,
         body: JSON.parse(Buffer.concat(chunks).toString("utf8")),
       }));
     });
@@ -61,6 +68,36 @@ async function requestWithHost(baseUrl, host) {
     outgoing.end();
   });
 }
+
+function lanAuthorization() {
+  return `Basic ${Buffer.from(`codex:${LAN_SHARED_SECRET}`).toString("base64")}`;
+}
+
+test("defaults the standalone server to loopback when no host env is set", async () => {
+  const { resolveHost } = await import("../server/index.mjs");
+  const previousHost = process.env.CODEX_TASKBOARD_HOST;
+  delete process.env.CODEX_TASKBOARD_HOST;
+  try {
+    assert.equal(resolveHost(), "127.0.0.1");
+  } finally {
+    if (previousHost === undefined) delete process.env.CODEX_TASKBOARD_HOST;
+    else process.env.CODEX_TASKBOARD_HOST = previousHost;
+  }
+});
+
+test("LAN binding requires a shared secret before the server starts", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "codex-taskboard-lan-secret-"));
+  const app = createTaskboardServer({ dataDirectory: directory });
+  try {
+    await assert.rejects(
+      app.listen({ host: "0.0.0.0", port: 0 }),
+      /TASKBOARD_SHARED_SECRET is required/,
+    );
+  } finally {
+    await app.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 test("health and the default local project are available", async () => {
   let skillPath;
@@ -712,17 +749,38 @@ test("workflow capabilities come from the live Codex skill and MCP catalogs", as
   const baseUrl = await startServer(async (directory) => {
     workspacePath = directory;
     const codexExecutable = path.join(directory, "fake-codex");
-    await writeFile(codexExecutable, `#!/bin/sh
-if [ "$1" = "mcp" ]; then
-  printf '%s\\n' '[{"name":"context7","enabled":true,"transport":{"type":"streamable_http"}},{"name":"disabled-server","enabled":false,"transport":{"type":"stdio"}}]'
-  exit 0
-fi
-while IFS= read -r line; do
-  case "$line" in
-    *'"id":1'*) printf '%s\\n' '{"id":1,"result":{"platformFamily":"unix"}}' ;;
-    *'"id":2'*) printf '%s\\n' '{"id":2,"result":{"data":[{"cwd":"workspace","skills":[{"name":"user-skill","enabled":true,"scope":"user","interface":null},{"name":"repo-skill","enabled":true,"scope":"repo","interface":{"displayName":"Repository Skill"}},{"name":"user-skill","enabled":true,"scope":"system","interface":{"displayName":"Duplicate"}},{"name":"disabled-skill","enabled":false,"scope":"user","interface":null}],"errors":[]}]}}' ;;
-  esac
-done
+    await writeFile(codexExecutable, `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args[0] === "debug") {
+  process.stdout.write('{"models":[{"slug":"gpt-real","display_name":"GPT Real","description":"","default_reasoning_level":"low","supported_reasoning_levels":[{"effort":"low"},{"effort":"high"}],"service_tiers":[]}]}');
+  process.exit(0);
+} else if (args[0] === "mcp") {
+  process.stdout.write('[{"name":"context7","enabled":true,"transport":{"type":"streamable_http"}},{"name":"disabled-server","enabled":false,"transport":{"type":"stdio"}}]');
+  process.exit(0);
+} else if (args[0] === "app-server") {
+  process.stdin.setEncoding("utf8");
+  let buffer = "";
+  process.stdin.on("data", (chunk) => {
+    buffer += chunk;
+    let index;
+    while ((index = buffer.indexOf("\\n")) >= 0) {
+      const line = buffer.slice(0, index);
+      buffer = buffer.slice(index + 1);
+      if (!line.trim()) continue;
+      const message = JSON.parse(line);
+      if (message.id === 1) process.stdout.write('{"id":1,"result":{"platformFamily":"unix"}}\\n');
+      if (message.id === 2) process.stdout.write('{"id":2,"result":{"data":[{"cwd":"workspace","skills":[{"name":"user-skill","enabled":true,"scope":"user","interface":null},{"name":"repo-skill","enabled":true,"scope":"repo","interface":{"displayName":"Repository Skill"}},{"name":"user-skill","enabled":true,"scope":"system","interface":{"displayName":"Duplicate"}},{"name":"disabled-skill","enabled":false,"scope":"user","interface":null}],"errors":[]}]}}\\n');
+    }
+  });
+} else {
+  process.stdin.resume();
+  process.stdin.on("end", () => {
+    process.stdout.write('{"type":"thread.started","thread_id":"session-1"}\\n');
+    process.stdout.write('{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}\\n');
+    process.stdout.write('{"type":"turn.completed"}\\n');
+  });
+}
+
 `);
     await chmod(codexExecutable, 0o755);
     return { codexExecutable };
@@ -735,8 +793,8 @@ done
   assert.equal(result.response.status, 200);
   assert.deepEqual(result.body, {
     skills: [
-      { id: "repo-skill", label: "Repository Skill", scope: "repo" },
-      { id: "user-skill", label: "user-skill", scope: "user" },
+      { id: "repo-skill", label: "Repository Skill", description: "", path: "", scope: "repo" },
+      { id: "user-skill", label: "user-skill", description: "", path: "", scope: "user" },
     ],
     mcpServers: [
       { id: "context7", label: "context7", transport: "streamable_http" },
@@ -1027,32 +1085,77 @@ test("device workspaces come from this machine's Codex project roots", async () 
 
 test("accepts private LAN requests and rejects public Host and Origin headers", async () => {
   const baseUrl = await startServer(undefined, { host: "0.0.0.0" });
+  const authorization = lanAuthorization();
 
   const codexOriginResult = await request(baseUrl, "/health", {
-    headers: { origin: "app://-" },
+    headers: { authorization, origin: "app://-" },
   });
   assert.equal(codexOriginResult.response.status, 200);
 
-  const lanHostResult = await requestWithHost(baseUrl, "192.168.1.24:47823");
+  const lanHostResult = await requestWithHost(baseUrl, "192.168.1.24:47823", { authorization });
   assert.equal(lanHostResult.status, 200);
 
-  const lanOriginResult = await request(baseUrl, "/health", {
-    headers: { origin: "http://192.168.1.24:47823" },
-  });
-  assert.equal(lanOriginResult.response.status, 200);
+  const lanOriginResult = await requestWithHost(
+    baseUrl,
+    "192.168.1.24:47823",
+    {
+      authorization,
+      origin: "http://192.168.1.24:47823",
+    },
+  );
+  assert.equal(lanOriginResult.status, 200);
+  assert.equal(lanOriginResult.headers["access-control-allow-origin"], undefined);
 
-  const localHostnameResult = await requestWithHost(baseUrl, "taskboard.local:47823");
+  const localHostnameResult = await requestWithHost(
+    baseUrl,
+    "taskboard.local:47823",
+    { authorization },
+  );
   assert.equal(localHostnameResult.status, 200);
+  assert.equal(localHostnameResult.headers["x-taskboard-bind-host"], "0.0.0.0");
 
-  const hostResult = await requestWithHost(baseUrl, "taskboard.example.com");
+  const hostResult = await requestWithHost(
+    baseUrl,
+    "taskboard.example.com",
+    { authorization },
+  );
   assert.equal(hostResult.status, 403);
   assert.equal(hostResult.body.error.code, "INVALID_HOST");
 
-  const originResult = await request(baseUrl, "/health", {
-    headers: { origin: "https://evil.example" },
-  });
-  assert.equal(originResult.response.status, 403);
+  const originResult = await requestWithHost(
+    baseUrl,
+    "192.168.1.24:47823",
+    {
+      authorization,
+      origin: "https://evil.example",
+    },
+  );
+  assert.equal(originResult.status, 403);
   assert.equal(originResult.body.error.code, "INVALID_ORIGIN");
+
+  const unauthorized = await requestWithHost(baseUrl, "192.168.1.24:47823");
+  assert.equal(unauthorized.status, 401);
+  assert.equal(unauthorized.body.error.code, "LAN_AUTH_REQUIRED");
+  assert.match(unauthorized.headers["www-authenticate"], /Basic/);
+
+  const wrongCredentials = await requestWithHost(
+    baseUrl,
+    "192.168.1.24:47823",
+    { authorization: `Basic ${Buffer.from("codex:wrong-secret").toString("base64")}` },
+  );
+  assert.equal(wrongCredentials.status, 401);
+  assert.equal(wrongCredentials.body.error.code, "LAN_AUTH_REQUIRED");
+
+  const mismatchedOrigin = await requestWithHost(
+    baseUrl,
+    "192.168.1.24:47823",
+    {
+      authorization,
+      origin: "http://192.168.1.25:47823",
+    },
+  );
+  assert.equal(mismatchedOrigin.status, 403);
+  assert.equal(mismatchedOrigin.body.error.code, "INVALID_ORIGIN");
 });
 
 test("project and task CRUD flow", async () => {
@@ -1896,9 +1999,9 @@ test("request boundaries reject unknown fields and invalid values", async () => 
 
 test("task changes from one LAN client are broadcast to another client", async () => {
   const baseUrl = await startServer(undefined, { host: "0.0.0.0" });
+  const authorization = lanAuthorization();
   const lanHeaders = {
-    host: "192.168.1.24:47823",
-    origin: "http://192.168.1.24:47823",
+    authorization,
   };
   const eventResponse = await fetch(`${baseUrl}/api/events`, { headers: lanHeaders });
   assert.equal(eventResponse.status, 200);

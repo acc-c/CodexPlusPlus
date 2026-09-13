@@ -1,13 +1,21 @@
 import os from "node:os";
 import { pathToFileURL } from "node:url";
 
-import { createTaskboardServer, resolveHost, resolvePort } from "./app.mjs";
+import {
+  LAN_SHARING_WARNING,
+  createTaskboardServer,
+  resolveHost,
+  resolvePort,
+} from "./app.mjs";
 
 export { createTaskboardServer, resolveHost, resolvePort, resolveServerOptions } from "./app.mjs";
 
 async function main() {
   const app = createTaskboardServer();
   const host = resolveHost();
+  if (host === "0.0.0.0") {
+    console.warn(LAN_SHARING_WARNING);
+  }
   const address = await app.listen({ host, port: resolvePort() });
   console.log(`Codex Taskboard listening on http://127.0.0.1:${address.port}`);
   if (host === "0.0.0.0") {

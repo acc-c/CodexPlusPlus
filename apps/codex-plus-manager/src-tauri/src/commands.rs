@@ -1,13 +1,10 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use codex_plus_core::install::SILENT_BINARY;
 use codex_plus_core::models::{DeleteResult, SessionRef};
@@ -17,6 +14,9 @@ use codex_plus_core::settings::{
     BackendSettings, RelayProfile, RelaySessionProvider, SettingsStore,
 };
 use codex_plus_core::status::{LaunchStatus, StatusStore};
+use codex_plus_core::taskboard_runtime::{
+    TASKBOARD_URL, spawn_taskboard_service, taskboard_health_ok, wait_for_taskboard_health,
+};
 use codex_plus_core::user_scripts::UserScriptManager;
 use codex_plus_core::zed_remote::{ZedOpenStrategy, ZedRemoteProject};
 use serde::Serialize;
@@ -1181,9 +1181,6 @@ fn spawn_silent_launcher(request: &LaunchRequest) -> anyhow::Result<()> {
     codex_plus_core::install::spawn_companion(SILENT_BINARY, &args).map(|_| ())
 }
 
-const TASKBOARD_PORT: u16 = 47823;
-const TASKBOARD_URL: &str = "http://127.0.0.1:47823/?host=codex";
-
 #[tauri::command]
 pub fn ensure_taskboard_service() -> CommandResult<TaskboardPayload> {
     if taskboard_health_ok() {
@@ -1216,64 +1213,6 @@ fn taskboard_payload(already_running: bool, launched: bool) -> TaskboardPayload 
         already_running,
         launched,
     }
-}
-
-fn wait_for_taskboard_health(timeout: Duration) -> bool {
-    let started_at = Instant::now();
-    while started_at.elapsed() < timeout {
-        if taskboard_health_ok() {
-            return true;
-        }
-        thread::sleep(Duration::from_millis(250));
-    }
-    false
-}
-
-fn taskboard_health_ok() -> bool {
-    let address = SocketAddr::from(([127, 0, 0, 1], TASKBOARD_PORT));
-    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(250)) else {
-        return false;
-    };
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(750)));
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(750)));
-    if stream
-        .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1:47823\r\nConnection: close\r\n\r\n")
-        .is_err()
-    {
-        return false;
-    }
-    let mut response = String::new();
-    stream.read_to_string(&mut response).is_ok()
-        && response.contains(" 200 ")
-        && response.contains("\"status\":\"ok\"")
-}
-
-fn spawn_taskboard_service() -> anyhow::Result<()> {
-    let mut command = taskboard_start_command();
-    command.env("CODEX_TASKBOARD_HOST", "127.0.0.1");
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
-    }
-    command.spawn()?;
-    Ok(())
-}
-
-#[cfg(target_os = "windows")]
-fn taskboard_start_command() -> Command {
-    let mut command = Command::new("cmd");
-    command.args(["/C", "codex-taskboard"]);
-    command
-}
-
-#[cfg(not(target_os = "windows"))]
-fn taskboard_start_command() -> Command {
-    Command::new("codex-taskboard")
 }
 
 pub fn start_weixin_connect_from_saved_settings() {
