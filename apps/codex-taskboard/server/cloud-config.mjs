@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 const CONFIG_VERSION = 1;
@@ -131,6 +131,7 @@ export function createCloudConfigStore({ configPath }) {
     await mkdir(path.dirname(configPath), { recursive: true });
     const temporaryPath = `${configPath}.${process.pid}.${Date.now()}.tmp`;
     await writeFile(temporaryPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+    await chmod(temporaryPath, 0o600);
     await rename(temporaryPath, configPath);
   }
 

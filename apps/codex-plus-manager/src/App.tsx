@@ -1107,7 +1107,6 @@ const defaultSettings: BackendSettings = {
 export function App() {
   const [theme, setTheme] = useState<Theme>(() => loadInitialTheme());
   const [route, setRoute] = useState<Route>(() => loadInitialRoute());
-  const [taskboardFrameVersion, setTaskboardFrameVersion] = useState(0);
   const [pendingSettingsSection, setPendingSettingsSection] = useState<ManagerNavigationIntent["section"] | null>(null);
   const [notice, setNotice] = useState<{ title: string; message: string; status?: Status } | null>(null);
   const [confirmDialog, setConfirmDialog] = useState<{
@@ -3178,10 +3177,6 @@ export function App() {
   const actions = useMemo(
     () => ({
       refreshCurrent: async () => {
-        if (route === "taskboard") {
-          setTaskboardFrameVersion((version) => version + 1);
-          return;
-        }
         await navigate(route);
       },
       launch,
@@ -3389,7 +3384,7 @@ export function App() {
     [route, launchForm, settingsForm, settings, overview, removeOwnedData, update, updateInstallProgress.active, logs, diagnostics, theme, relayFiles, localSessions, sessionShareUrl, importSessionUrl, zedRemoteProjects, selectedProviderSyncTarget, envConflicts, relayEnvironment, ccsProviders, dreamSkinLibrary, dreamSkinMarket, dreamSkinCommunity, selectedDreamSkinTheme, savedDreamSkinThemeDraft, dreamSkinThemeDraft, dreamSkinDraftDirty, pendingDreamSkinRestart],
   );
   const hasUpdate = update?.updateAvailable === true;
-  const taskboardEnabled = settingsForm.enhancementsEnabled && settingsForm.codexTaskboardEnabled;
+  const taskboardEnabled = settingsForm.codexTaskboardEnabled;
 
   return (
     <div className={`shell ${theme}`}>
@@ -3588,10 +3583,7 @@ export function App() {
             />
           ) : null}
           {route === "taskboard" && taskboardEnabled ? (
-            <TaskboardScreen
-              frameVersion={taskboardFrameVersion}
-              actions={actions}
-            />
+            <TaskboardScreen actions={actions} />
           ) : null}
           {route === "zedRemote" ? (
             <ZedRemoteScreen projects={zedRemoteProjects} form={settingsForm} onFormChange={setSettingsForm} actions={actions} />
@@ -3816,23 +3808,20 @@ type Actions = {
   checkHealth: () => Promise<void>;
 };
 
-function TaskboardScreen({ frameVersion, actions }: { frameVersion: number; actions: Pick<Actions, "refreshCurrent" | "openExternalUrl"> }) {
+function TaskboardScreen({ actions }: { actions: Pick<Actions, "launch" | "openExternalUrl"> }) {
   const [serviceStatus, setServiceStatus] = useState<Status>("not_checked");
-  const [serviceMessage, setServiceMessage] = useState("Starting Taskboard...");
+  const [serviceMessage, setServiceMessage] = useState(t("尚未检测任务服务。"));
   const [serviceStarting, setServiceStarting] = useState(false);
   const serviceTone = serviceStatus === "ok" ? "good" : serviceStatus === "failed" ? "bad" : "pending";
 
   const startTaskboard = async () => {
     setServiceStarting(true);
     setServiceStatus("not_checked");
-    setServiceMessage("Starting Taskboard...");
+    setServiceMessage(t("正在启动任务服务…"));
     try {
       const result = await invoke<TaskboardServiceResult>("ensure_taskboard_service");
       setServiceStatus(result.status);
       setServiceMessage(result.message);
-      if (isSuccessStatus(result.status)) {
-        await actions.refreshCurrent();
-      }
     } catch (error) {
       setServiceStatus("failed");
       setServiceMessage(stringifyError(error));
@@ -3846,29 +3835,54 @@ function TaskboardScreen({ frameVersion, actions }: { frameVersion: number; acti
   }, []);
 
   return (
-    <div className="taskboard-embed">
-      <div className="taskboard-embed-toolbar">
-        <div className="taskboard-embed-meta">
-          <span className="taskboard-embed-origin">127.0.0.1:47823</span>
-          <span className={`taskboard-embed-status taskboard-embed-status-${serviceTone}`}>
-            {serviceStarting ? "Starting Taskboard..." : serviceMessage}
-          </span>
-        </div>
-        <div className="taskboard-embed-actions">
-          <Button disabled={serviceStarting} onClick={() => void startTaskboard()} size="icon" title="Start or refresh Taskboard" variant="outline">
-            <RefreshCw className="h-4 w-4" />
-          </Button>
-          <Button onClick={() => void actions.openExternalUrl(TASKBOARD_PANEL_URL)} size="icon" title="Open Taskboard in browser" variant="outline">
-            <ExternalLink className="h-4 w-4" />
-          </Button>
-        </div>
-      </div>
-      <iframe
-        className="taskboard-embed-frame"
-        key={frameVersion}
-        src={TASKBOARD_PANEL_URL}
-        title="Taskboard"
-      />
+    <div className="taskboard-controller">
+      <Card className="panel">
+        <CardHeader>
+          <div className="taskboard-controller-heading">
+            <div>
+              <CardTitle>{t("任务面板控制器")}</CardTitle>
+              <CardDescription>{t("Manager 只负责启动服务和诊断；真正入口由 Codex++ 注入到 Codex 原生侧边栏。")}</CardDescription>
+            </div>
+            <Badge status={serviceStatus} />
+          </div>
+        </CardHeader>
+        <CardContent className="taskboard-controller-content">
+          <div className="taskboard-controller-status">
+            <span className="taskboard-controller-origin">127.0.0.1:47823</span>
+            <span className={`taskboard-controller-status-text taskboard-controller-status-${serviceTone}`}>
+              {serviceStarting ? t("正在启动任务服务…") : serviceMessage}
+            </span>
+          </div>
+          <div className="taskboard-controller-actions">
+            <Button disabled={serviceStarting} onClick={() => void startTaskboard()} variant="outline">
+              <RefreshCw className="h-4 w-4" />
+              {serviceStarting ? t("检测中") : t("启动/检测服务")}
+            </Button>
+            <Button onClick={() => void actions.launch()} variant="secondary">
+              <Rocket className="h-4 w-4" />
+              {t("启动 Codex 并注入")}
+            </Button>
+            <Button onClick={() => void actions.openExternalUrl(TASKBOARD_PANEL_URL)} variant="ghost">
+              <ExternalLink className="h-4 w-4" />
+              {t("浏览器调试")}
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+      <Card className="panel">
+        <CardHeader>
+          <CardTitle>{t("最终入口")}</CardTitle>
+          <CardDescription>{t("用户应在 Codex 侧边栏看到“任务面板”，而不是在 Manager 内打开一个内嵌页面。")}</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="taskboard-controller-flow">
+            <span>{t("1. Codex++ Launcher 启动 Codex，并打开 CDP 调试端口。")}</span>
+            <span>{t("2. Launcher 启动 Taskboard runtime 和 sidebar injector。")}</span>
+            <span>{t("3. injector 在 Codex 原生侧边栏插入“任务面板”。")}</span>
+            <span>{t("4. 点击“任务面板”后，Taskboard iframe 挂载在 Codex 主工作区。")}</span>
+          </div>
+        </CardContent>
+      </Card>
     </div>
   );
 }

@@ -30,7 +30,7 @@ test("embedded page uses the local taskboard URL and supports a runtime override
 
 test("entry clones the native Plugins row and the page covers the complete Codex workspace", () => {
   assert.match(source, /const PLUGIN_LABELS = \["插件", "plugins"\]/);
-  assert.match(source, /if \(siblings\.length >= 3\) return plugin;/);
+  assert.match(source, /if \(plugin\?\.parentElement\) return plugin;/);
   assert.match(source, /return directButtons\.length >= 3/);
   assert.match(source, /const button = reference\.cloneNode\(true\)/);
   assert.match(source, /reference\.after\(entry\)/);
@@ -213,7 +213,7 @@ test("the iframe automation contract is forwarded through the fixed host binding
 test("complete App automation payloads cross the injected forwarder into the current parser", () => {
   const functionSource = source.slice(
     source.indexOf("function buildAutomationHostPayload"),
-    source.indexOf("\n\n  async function handleAutomationRequest"),
+    source.search(/\r?\n\r?\n  async function handleAutomationRequest/),
   );
   assert.ok(functionSource.startsWith("function buildAutomationHostPayload"));
   const buildAutomationHostPayload = vm.runInNewContext(`(${functionSource})`);

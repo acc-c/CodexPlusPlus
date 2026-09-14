@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawnExecutable } from "./executable.mjs";
 
 const VISIBLE_TEXT_LIMIT = 65_536;
 const STDERR_LIMIT = 65_536;
@@ -336,7 +336,7 @@ export function spawnCodexTurn({
   onRawEvent,
   maxLineBytes = 1_048_576,
 }) {
-  const child = spawn(executable, args, {
+  const child = spawnExecutable(executable, args, {
     detached: true,
     env,
     stdio: ["pipe", "pipe", "pipe"],

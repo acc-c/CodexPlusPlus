@@ -445,37 +445,32 @@ body {
   will-change: opacity, transform;
 }
 
-.taskboard-embed {
-  display: flex;
-  flex-direction: column;
-  height: calc(100vh - 128px);
-  min-height: 560px;
-  min-width: 0;
-  overflow: hidden;
-  border: 1px solid hsl(var(--border));
-  border-radius: 8px;
-  background: hsl(var(--surface-sunken));
+.taskboard-controller {
+  display: grid;
+  align-content: start;
+  gap: 12px;
 }
 
-.taskboard-embed-toolbar {
+.taskboard-controller-heading {
   display: flex;
-  flex: 0 0 auto;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
-  gap: 10px;
-  padding: 8px 10px;
-  border-bottom: 1px solid hsl(var(--border));
-  background: hsl(var(--card));
+  gap: 12px;
 }
 
-.taskboard-embed-meta {
+.taskboard-controller-content {
+  display: grid;
+  gap: 14px;
+}
+
+.taskboard-controller-status {
   display: flex;
   min-width: 0;
   align-items: center;
   gap: 10px;
 }
 
-.taskboard-embed-origin {
+.taskboard-controller-origin {
   min-width: 0;
   overflow: hidden;
   color: hsl(var(--muted-foreground));
@@ -485,7 +480,7 @@ body {
   white-space: nowrap;
 }
 
-.taskboard-embed-status {
+.taskboard-controller-status-text {
   min-width: 0;
   overflow: hidden;
   font-size: 12px;
@@ -493,31 +488,30 @@ body {
   white-space: nowrap;
 }
 
-.taskboard-embed-status-good {
+.taskboard-controller-status-good {
   color: hsl(var(--status-success));
 }
 
-.taskboard-embed-status-bad {
+.taskboard-controller-status-bad {
   color: hsl(var(--destructive));
 }
 
-.taskboard-embed-status-pending {
+.taskboard-controller-status-pending {
   color: hsl(var(--muted-foreground));
 }
 
-.taskboard-embed-actions {
+.taskboard-controller-actions {
   display: inline-flex;
-  flex: 0 0 auto;
+  flex-wrap: wrap;
   gap: 6px;
 }
 
-.taskboard-embed-frame {
-  display: block;
-  flex: 1 1 auto;
-  width: 100%;
-  min-height: 0;
-  border: 0;
-  background: hsl(var(--surface-sunken));
+.taskboard-controller-flow {
+  display: grid;
+  gap: 8px;
+  color: hsl(var(--muted-foreground));
+  font-size: 13px;
+  line-height: 1.5;
 }
 
 .grid {

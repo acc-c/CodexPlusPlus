@@ -92,9 +92,6 @@ fn taskboard_health_response_matches(response: &str, expected_host: &str) -> boo
     if !response.contains(" 200 ") || !response.contains("\"status\":\"ok\"") {
         return false;
     }
-    if expected_host != LAN_TASKBOARD_HOST {
-        return true;
-    }
     response.lines().any(|line| {
         let Some((name, value)) = line.split_once(':') else {
             return false;
@@ -336,7 +333,7 @@ mod tests {
     }
 
     #[test]
-    fn lan_health_requires_verified_bind_host() {
+    fn health_requires_verified_bind_host() {
         let unverified_response =
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\"status\":\"ok\"}";
         let loopback_response =
@@ -344,16 +341,20 @@ mod tests {
         let lan_response =
             "HTTP/1.1 200 OK\r\nx-taskboard-bind-host: 0.0.0.0\r\n\r\n{\"status\":\"ok\"}";
 
-        assert!(taskboard_health_response_matches(
+        assert!(!taskboard_health_response_matches(
             unverified_response,
+            LOOPBACK_TASKBOARD_HOST
+        ));
+        assert!(taskboard_health_response_matches(
+            loopback_response,
             LOOPBACK_TASKBOARD_HOST
         ));
         assert!(!taskboard_health_response_matches(
             unverified_response,
             LAN_TASKBOARD_HOST
         ));
-        assert!(taskboard_health_response_matches(
-            loopback_response,
+        assert!(!taskboard_health_response_matches(
+            lan_response,
             LOOPBACK_TASKBOARD_HOST
         ));
         assert!(taskboard_health_response_matches(

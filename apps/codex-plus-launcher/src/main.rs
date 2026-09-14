@@ -256,6 +256,9 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
             "launch_error": launch_result.as_ref().err().map(|error| error.to_string())
         }),
     );
+    if launch_result.is_ok() {
+        start_taskboard_sidebar_injector_if_enabled(&settings, options.debug_port);
+    }
     launch_result.map(|_| ())
 }
 
@@ -334,11 +337,13 @@ fn start_taskboard_sidebar_injector_if_enabled(
 }
 
 fn spawn_taskboard_sidebar_injector(debug_port: u16) -> anyhow::Result<Option<u32>> {
-    let Some(taskboard_root) = taskboard_root_from_current_exe() else {
+    let Some(taskboard_root) =
+        codex_plus_core::taskboard_runtime::taskboard_root_from_current_exe()
+    else {
         return Ok(None);
     };
     let injector = taskboard_root.join("scripts").join("codex-injector.mjs");
-    let mut command = Command::new(taskboard_node_executable());
+    let mut command = Command::new(codex_plus_core::taskboard_runtime::taskboard_node_executable());
     command
         .current_dir(&taskboard_root)
         .arg(injector)
@@ -355,63 +360,6 @@ fn spawn_taskboard_sidebar_injector(debug_port: u16) -> anyhow::Result<Option<u3
     }
     let child = command.spawn()?;
     Ok(Some(child.id()))
-}
-
-fn taskboard_root_from_current_exe() -> Option<PathBuf> {
-    taskboard_root_from_env().or_else(|| {
-        std::env::current_exe()
-            .ok()
-            .and_then(|path| taskboard_root_for_exe_path(&path))
-    })
-}
-
-fn taskboard_root_from_env() -> Option<PathBuf> {
-    let root = std::env::var_os("CODEX_TASKBOARD_ROOT").map(PathBuf::from)?;
-    taskboard_injector_script_exists(&root).then_some(root)
-}
-
-fn taskboard_root_for_exe_path(exe_path: &Path) -> Option<PathBuf> {
-    let start = if exe_path.is_dir() {
-        exe_path
-    } else {
-        exe_path.parent()?
-    };
-    for directory in start.ancestors() {
-        let root = directory.join("apps").join("codex-taskboard");
-        if taskboard_injector_script_exists(&root) {
-            return Some(root);
-        }
-    }
-    None
-}
-
-fn taskboard_injector_script_exists(root: &Path) -> bool {
-    root.join("scripts").join("codex-injector.mjs").is_file()
-}
-
-fn taskboard_node_executable() -> PathBuf {
-    if let Some(path) = std::env::var_os("CODEX_TASKBOARD_NODE_EXE").map(PathBuf::from) {
-        if path.is_file() {
-            return path;
-        }
-    }
-    if let Some(path) = bundled_codex_node_executable() {
-        return path;
-    }
-    PathBuf::from(if cfg!(windows) { "node.exe" } else { "node" })
-}
-
-fn bundled_codex_node_executable() -> Option<PathBuf> {
-    let home = directories::BaseDirs::new()?.home_dir().to_path_buf();
-    let node = home
-        .join(".cache")
-        .join("codex-runtimes")
-        .join("codex-primary-runtime")
-        .join("dependencies")
-        .join("node")
-        .join("bin")
-        .join(if cfg!(windows) { "node.exe" } else { "node" });
-    node.is_file().then_some(node)
 }
 
 fn parse_launch_options<I, S>(args: I) -> LaunchOptions
@@ -1280,8 +1228,15 @@ mod tests {
             .join("codex-taskboard")
             .join("scripts")
             .join("codex-injector.mjs");
+        let server = test_dir
+            .join("apps")
+            .join("codex-taskboard")
+            .join("server")
+            .join("index.mjs");
         std::fs::create_dir_all(script.parent().unwrap()).unwrap();
         std::fs::write(&script, "").unwrap();
+        std::fs::create_dir_all(server.parent().unwrap()).unwrap();
+        std::fs::write(&server, "").unwrap();
         let exe = test_dir
             .join("target")
             .join("debug")
@@ -1293,7 +1248,7 @@ mod tests {
         std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
 
         assert_eq!(
-            taskboard_root_for_exe_path(&exe),
+            codex_plus_core::taskboard_runtime::taskboard_root_for_exe_path(&exe),
             Some(test_dir.join("apps").join("codex-taskboard"))
         );
         let _ = std::fs::remove_dir_all(test_dir);
@@ -1394,6 +1349,28 @@ mod tests {
         assert!(!body.contains("hooks.ensure_injection"));
         assert!(!body.contains("hooks.start_bridge_watchdog"));
         assert!(body.contains("can_connect_loopback_port(options.helper_port)"));
+    }
+
+    #[test]
+    fn existing_launcher_path_starts_taskboard_injector_after_activation() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("async fn activate_existing_codex_app")
+            .expect("existing launcher activation function");
+        let end = source[start..]
+            .find("fn should_finalize_pending_remote_control_recovery")
+            .map(|offset| start + offset)
+            .expect("next function after existing launcher activation");
+        let body = &source[start..end];
+        let launch = body
+            .find("let launch_result = hooks")
+            .expect("Codex activation");
+        let injector = body
+            .find("start_taskboard_sidebar_injector_if_enabled(&settings, options.debug_port)")
+            .expect("Taskboard injector startup");
+
+        assert!(launch < injector);
+        assert!(body[..injector].contains("if launch_result.is_ok()"));
     }
 
     #[test]

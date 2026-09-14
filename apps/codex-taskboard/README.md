@@ -51,7 +51,7 @@ npm run taskctl -- issue create \
   --labels product,mvp
 ```
 
-Use `npm link` if you want `taskctl` on your shell path. Set `CODEX_TASKBOARD_URL` to point the CLI at another local or LAN service. Cloud deployments are configured through the loopback companion with `taskctl cloud login`.
+Use `npm link` if you want `taskctl` on your shell path. Set `CODEX_TASKBOARD_URL` to point the CLI at another local service. Cloud deployments are configured through the loopback companion with `taskctl cloud login`.
 
 ## Install the Codex Skill
 
@@ -115,14 +115,15 @@ To use a different UI origin, set `window.__CODEX_TASKBOARD_URL__` before the us
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `CODEX_TASKBOARD_HOST` | `0.0.0.0` | HTTP bind address; use `127.0.0.1` to disable LAN access |
+| `CODEX_TASKBOARD_HOST` | `127.0.0.1` | HTTP bind address; set `0.0.0.0` only to explicitly share on a private LAN |
+| `TASKBOARD_SHARED_SECRET` | unset | Required for `0.0.0.0`; protects every request with Basic authentication |
 | `CODEX_TASKBOARD_PORT` | `47823` | Local HTTP port |
 | `CODEX_TASKBOARD_DATA_DIR` | `.data` | SQLite data directory |
 | `CODEX_TASKBOARD_URL` | `http://127.0.0.1:47823` | CLI API origin |
 
-`npm start` prints both the local URL and the available LAN URLs. Teammates on the same trusted network can open one of those LAN URLs and use the same taskboard service. Task, comment, and attachment changes are broadcast to every open client through server-sent events; reconnecting clients perform a full refresh so changes made while disconnected are not missed. A teammate using `taskctl` can point it at the shared service with `CODEX_TASKBOARD_URL=http://<host-ip>:47823`.
+By default, the service binds only to `127.0.0.1`. LAN sharing is opt-in: set `CODEX_TASKBOARD_HOST=0.0.0.0` and a non-empty `TASKBOARD_SHARED_SECRET`. Startup prints a warning before binding and then lists detected LAN URLs. Every LAN request must use Basic authentication and an HTTP `Origin` matching its `Host`; cross-origin requests are rejected and the server does not emit wildcard CORS headers. Do not expose the service to the public internet.
 
-LAN mode has no account authentication: anyone on the trusted local network who can reach the URL can read and write the taskboard. Public internet and cloud deployment require an authenticated deployment boundary.
+Task, comment, and attachment changes are broadcast to every open client through server-sent events; reconnecting clients perform a full refresh so changes made while disconnected are not missed. `taskctl` remains configured for the local companion URL; use the browser UI or an authenticated deployment boundary for shared access.
 
 ## Share through Cloudflare
 

@@ -2,6 +2,7 @@ import type {
   AiChatEvent,
   AiChatAttachmentInput,
   AiChatModel,
+  AiChatSkill,
   AiChatSandbox,
   AiChatThread,
   AiChatThreadSnapshot,
@@ -52,6 +53,14 @@ export function buildThreadCreateInput(projectId: string, issueId: string | null
   };
 }
 
+export function settingsForNewAiThread<T extends Record<string, unknown>>(
+  targetProjectId: string,
+  catalogProjectId: string | null | undefined,
+  settings: T,
+): T | Record<string, never> {
+  return catalogProjectId === targetProjectId ? settings : {};
+}
+
 export function routeChatState(
   state: AiChatRouteState,
   projectId: string | null,
@@ -74,6 +83,39 @@ export function normalizeChatSelection(
   return {
     model: selectedModel.slug,
     reasoningEffort: reasoningEffortForModel(selectedModel, reasoningEffort),
+  };
+}
+
+export function readSkillMention(
+  value: string,
+  caret: number,
+): { start: number; end: number; query: string } | null {
+  if (typeof value !== "string" || !Number.isFinite(caret)) return null;
+  const end = Math.min(Math.max(0, Math.trunc(caret)), value.length);
+  const rawPrefix = value.slice(0, end);
+  const prefix = rawPrefix.replaceAll("\u200B", "");
+  const match = /(?:^|\s)@([^\s@]*)$/.exec(prefix);
+  if (!match) return null;
+  const start = rawPrefix.lastIndexOf("@");
+  if (start < 0) return null;
+  return {
+    start,
+    end,
+    query: match[1].toLocaleLowerCase(),
+  };
+}
+
+export function insertSkillMention(
+  value: string,
+  start: number,
+  end: number,
+  skill: Pick<AiChatSkill, "id" | "label">,
+): { value: string; caret: number; skillId: string } {
+  const mention = `@${skill.label}`;
+  return {
+    value: `${value.slice(0, start)}${mention}${value.slice(end)}`,
+    caret: start + mention.length,
+    skillId: skill.id,
   };
 }
 

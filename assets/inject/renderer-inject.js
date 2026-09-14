@@ -416,6 +416,7 @@
   const codexPlusMenuRightReservePx = 120;
   const codexPlusSidebarNavId = "codex-plus-sidebar-nav";
   const codexPlusPageClass = "codex-plus-page-overlay";
+  const codexPlusSurfaceVersion = "2";
   const codexDeleteVersion = "10";
   const codexExportVersion = "1";
   const codexProjectMoveVersion = "1";
@@ -471,6 +472,9 @@
   ]);
   let codexPlusVersion = window.__CODEX_PLUS_VERSION__ || "unknown";
   const codexPlusBuild = window.__CODEX_PLUS_BUILD__ || "unknown";
+  document.querySelectorAll(`.${codexPlusPageClass}, .codex-plus-modal-overlay`).forEach((node) => {
+    if (node.dataset.codexPlusSurfaceVersion !== codexPlusSurfaceVersion) node.remove();
+  });
   let lastSessionActionTrigger = null;
   const codexPlusSettingsKey = "codexPlusSettings";
   const codexThreadScrollKey = "codexThreadScroll";
@@ -4162,8 +4166,31 @@
     }
   }
 
+  function closeCodexPlusSurfaces() {
+    document.querySelectorAll(`.${codexPlusPageClass}, .codex-plus-modal-overlay`).forEach((node) => node.remove());
+    setCodexPlusSidebarNavActive(false);
+  }
+
+  function openCodexTaskboardInlinePage() {
+    closeCodexPlusSurfaces();
+    const api = window.__codexTaskboardInjection__;
+    if (api && typeof api.open === "function") {
+      api.open();
+      return true;
+    }
+    const entry = document.getElementById("codex-taskboard-entry");
+    if (entry && typeof entry.click === "function") {
+      entry.click();
+      return true;
+    }
+    return false;
+  }
+
   async function openTaskboardFromCodex() {
-    const taskboardWindow = window.open("about:blank", "_blank");
+    if (openCodexTaskboardInlinePage()) {
+      return;
+    }
+    const taskboardWindow = window.open(taskboardPanelUrl, "_blank");
     const result = await postJson("/taskboard/open", {});
     if (result.status === "ok") {
       const url = typeof result.url === "string" && result.url ? result.url : taskboardPanelUrl;
@@ -4439,6 +4466,7 @@
     const overlay = document.createElement("div");
     overlay.className = pageMode ? codexPlusPageClass : "codex-plus-modal-overlay";
     overlay.dataset.codexPlusPage = String(pageMode);
+    overlay.dataset.codexPlusSurfaceVersion = codexPlusSurfaceVersion;
     applyCodexPlusTheme(overlay);
     overlay.innerHTML = `
       <div class="codex-plus-modal-content" role="dialog" aria-modal="true" aria-label="Codex++">
@@ -4811,6 +4839,7 @@
       button.removeAttribute("disabled");
       button.removeAttribute("aria-disabled");
       button.setAttribute("aria-label", "Codex++");
+      button.dataset.codexPlusOpenHandlerVersion = codexPlusBuild;
       button.textContent = "";
       button.innerHTML = `<span class="codex-plus-sidebar-nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18M3 12h18M5.5 5.5l13 13M18.5 5.5l-13 13"/></svg></span><span class="truncate">Codex++</span><span class="codex-plus-sidebar-nav-status" data-status="${codexPlusBackendStatus.status || "checking"}" aria-hidden="true"></span>`;
       button.addEventListener("click", (event) => {
@@ -4823,6 +4852,19 @@
         parent.insertBefore(wrapper, insertionButton.nextSibling);
       } else {
         parent.appendChild(wrapper);
+      }
+    }
+    const sidebarButton = wrapper.querySelector("button");
+    if (sidebarButton instanceof HTMLElement && sidebarButton.dataset.codexPlusOpenHandlerVersion !== codexPlusBuild) {
+      const replacement = sidebarButton.cloneNode(true);
+      if (replacement instanceof HTMLElement) {
+        replacement.dataset.codexPlusOpenHandlerVersion = codexPlusBuild;
+        replacement.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          openCodexPlusPage();
+        }, true);
+        sidebarButton.replaceWith(replacement);
       }
     }
     const status = wrapper.querySelector(".codex-plus-sidebar-nav-status");

@@ -19,7 +19,13 @@ import {
 
 const execFile = promisify(execFileCallback);
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const defaultWrangler = path.join(projectRoot, "node_modules", ".bin", "wrangler");
+
+const defaultWrangler = process.platform === "win32"
+  ? process.execPath
+  : path.join(projectRoot, "node_modules", ".bin", "wrangler");
+const defaultWranglerArgs = process.platform === "win32"
+  ? [path.join(projectRoot, "node_modules", "wrangler", "bin", "wrangler.js")]
+  : [];
 
 function parseD1Results(stdout) {
   const parsed = JSON.parse(stdout);
@@ -73,7 +79,10 @@ export function createWranglerCloudAdapters({
   let sequence = 0;
 
   function run(args) {
-    const result = commandQueue.then(() => runCommand(wranglerExecutable, args, {
+    const commandArgs = runCommand === execFile && wranglerExecutable === defaultWrangler
+      ? [...defaultWranglerArgs, ...args]
+      : args;
+    const result = commandQueue.then(() => runCommand(wranglerExecutable, commandArgs, {
       cwd: projectRoot,
       encoding: "utf8",
       maxBuffer: 16 * 1024 * 1024,

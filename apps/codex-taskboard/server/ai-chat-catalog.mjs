@@ -1,11 +1,8 @@
-import { execFile, spawn } from "node:child_process";
 import { readFile, realpath, stat } from "node:fs/promises";
 import path from "node:path";
-import { promisify } from "node:util";
 
 import { ApiError } from "./database.mjs";
-
-const execFileAsync = promisify(execFile);
+import { execFileExecutable, spawnExecutable } from "./executable.mjs";
 const CATALOG_TIMEOUT_MS = 10_000;
 const CATALOG_MAX_BUFFER = 2 * 1024 * 1024;
 
@@ -117,7 +114,7 @@ function sanitizeModels(value) {
 
 function listSkills(codexExecutable, workspacePath, processEnv) {
   return new Promise((resolve, reject) => {
-    const child = spawn(codexExecutable, ["app-server", "--stdio"], {
+    const child = spawnExecutable(codexExecutable, ["app-server", "--stdio"], {
       cwd: workspacePath,
       env: processEnv,
       stdio: ["pipe", "pipe", "ignore"],
@@ -238,7 +235,7 @@ export async function discoverAiCatalog({
 }) {
   const { workspacePath } = await resolveAiWorkspace(projectId, codexStatePath, database);
   const [modelResult, skillEntries] = await Promise.all([
-    execFileAsync(codexExecutable, ["debug", "models"], {
+    execFileExecutable(codexExecutable, ["debug", "models"], {
       cwd: workspacePath,
       env: processEnv,
       encoding: "utf8",

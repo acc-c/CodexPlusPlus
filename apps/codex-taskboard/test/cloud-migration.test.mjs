@@ -32,8 +32,16 @@ const fixtures = [];
 const timestamp = "2026-07-24T12:00:00.000Z";
 const execFile = promisify(execFileCallback);
 const projectRoot = path.resolve(import.meta.dirname, "..");
-const wranglerExecutable = path.join(projectRoot, "node_modules", ".bin", "wrangler");
+const wranglerBinary = path.join(projectRoot, "node_modules", ".bin", "wrangler");
+const wranglerExecutable = process.platform === "win32" ? process.execPath : wranglerBinary;
+const wranglerArgs = process.platform === "win32"
+  ? [path.join(projectRoot, "node_modules", "wrangler", "bin", "wrangler.js")]
+  : [];
 const wranglerConfig = path.join(projectRoot, "wrangler.jsonc");
+
+function assertPrivateMode(actual, expected) {
+  if (process.platform !== "win32") assert.equal(actual & 0o777, expected);
+}
 
 afterEach(async () => {
   while (fixtures.length > 0) {
@@ -906,16 +914,10 @@ test("versioned bundle round-trips through private manifest, data, and attachmen
 
   await writeCloudMigrationBundle(bundle, outputDirectory);
 
-  assert.equal((await stat(outputDirectory)).mode & 0o777, 0o700);
-  assert.equal((await stat(path.join(outputDirectory, "data"))).mode & 0o777, 0o700);
-  assert.equal(
-    (await stat(path.join(outputDirectory, "attachments"))).mode & 0o777,
-    0o700,
-  );
-  assert.equal(
-    (await stat(path.join(outputDirectory, "manifest.json"))).mode & 0o777,
-    0o600,
-  );
+  assertPrivateMode((await stat(outputDirectory)).mode, 0o700);
+  assertPrivateMode((await stat(path.join(outputDirectory, "data"))).mode, 0o700);
+  assertPrivateMode((await stat(path.join(outputDirectory, "attachments"))).mode, 0o700);
+  assertPrivateMode((await stat(path.join(outputDirectory, "manifest.json"))).mode, 0o600);
 
   const restored = await readCloudMigrationBundle(outputDirectory);
   assert.deepEqual(restored.counts, bundle.counts);
@@ -999,7 +1001,7 @@ test("Wrangler adapter requires remote opt-in and keeps transfer files private",
       if (fileIndex !== -1) {
         const filename = args[fileIndex + 1];
         transferFiles.push(filename);
-        if (args[0] === "r2" && args[2] === "get") {
+        if (args.includes("get") && args.includes("object")) {
           await writeFile(filename, downloadedBody);
         }
       }
@@ -1036,8 +1038,8 @@ test("Wrangler adapter requires remote opt-in and keeps transfer files private",
       assert.ok(!args.includes("--persist-to"));
     }
     for (const filename of transferFiles) {
-      assert.equal((await stat(filename)).mode & 0o777, 0o600);
-      assert.equal((await stat(path.dirname(filename))).mode & 0o777, 0o700);
+      assertPrivateMode((await stat(filename)).mode, 0o600);
+      assertPrivateMode((await stat(path.dirname(filename))).mode, 0o700);
     }
   } finally {
     await adapters.cleanup();
@@ -1094,6 +1096,7 @@ test("one-time Wrangler adapter migrates and verifies local persistence without 
 
   async function applyMigrations(persistTo) {
     await execFile(wranglerExecutable, [
+      ...wranglerArgs,
       "d1",
       "migrations",
       "apply",

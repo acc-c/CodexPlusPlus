@@ -7,6 +7,8 @@ import { test } from "node:test";
 
 import { createTaskboardServer } from "../server/index.mjs";
 
+const LAN_SHARED_SECRET = "test-taskboard-secret";
+
 async function createServerFixture(host = "127.0.0.1") {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-ai-server-"));
   const workspacePath = path.join(directory, "workspace");
@@ -42,6 +44,7 @@ if (args[0] === "debug") {
   }));
   const app = createTaskboardServer({
     dataDirectory: directory,
+    ...(host === "0.0.0.0" ? { sharedSecret: LAN_SHARED_SECRET } : {}),
     codexExecutable,
     codexStatePath,
     skillPath: "/fixture/manage-taskboard/SKILL.md",
@@ -54,7 +57,12 @@ if (args[0] === "debug") {
     workspace,
     async close() {
       await app.close();
-      await rm(directory, { recursive: true, force: true });
+      await rm(directory, {
+        recursive: true,
+        force: true,
+        maxRetries: 20,
+        retryDelay: 50,
+      });
     },
   };
 }
@@ -78,7 +86,10 @@ async function requestFrom(address, port, pathname) {
       host: address,
       port,
       path: pathname,
-      headers: { host: `${address}:${port}` },
+      headers: {
+        authorization: `Basic ${Buffer.from(`codex:${LAN_SHARED_SECRET}`).toString("base64")}`,
+        host: `${address}:${port}`,
+      },
     }, (response) => {
       const chunks = [];
       response.on("data", (chunk) => chunks.push(chunk));
@@ -134,14 +145,14 @@ test("loopback AI API freezes server-owned origin and rejects injected execution
 
     const invalidSkill = await request(fixture.baseUrl, `/api/local/ai/threads/${threadId}/turns`, {
       method: "POST",
-      body: { message: "hello", skillIds: ["invented-skill"] },
+      body: { message: "hello\uFFFC", skillIds: ["invented-skill"] },
     });
     assert.equal(invalidSkill.response.status, 400);
     assert.equal(invalidSkill.body.error.code, "INVALID_SKILL");
 
     const turn = await request(fixture.baseUrl, `/api/local/ai/threads/${threadId}/turns`, {
       method: "POST",
-      body: { message: "hello", skillIds: ["real-skill"] },
+      body: { message: "hello\uFFFC", skillIds: ["real-skill"] },
     });
     assert.equal(turn.response.status, 202);
     assert.equal(turn.body.run.threadId, threadId);
@@ -318,7 +329,12 @@ test("server close stops accepting requests before AI shutdown completes", async
     assert.equal(acceptedDuringClose, false);
   } finally {
     if (appClosed) {
-      await rm(fixture.directory, { recursive: true, force: true });
+      await rm(fixture.directory, {
+        recursive: true,
+        force: true,
+        maxRetries: 20,
+        retryDelay: 50,
+      });
     } else {
       await fixture.close();
     }

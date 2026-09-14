@@ -11,7 +11,8 @@ use crate::models::{DeleteResult, DeleteStatus, ExportResult, ExportStatus, Sess
 use crate::settings::{BackendSettings, SettingsStore};
 use crate::status::StatusStore;
 use crate::taskboard_runtime::{
-    TASKBOARD_URL, spawn_taskboard_service, taskboard_health_ok, wait_for_taskboard_health,
+    TASKBOARD_URL, spawn_taskboard_service, taskboard_health_ok, taskboard_launch_warning,
+    wait_for_taskboard_health,
 };
 use crate::user_scripts::UserScriptManager;
 
@@ -346,7 +347,10 @@ fn open_taskboard_panel() -> Value {
     }
 
     if wait_for_taskboard_health(Duration::from_secs(8)) {
-        taskboard_response("ok", "Taskboard started.", false, true)
+        let message = taskboard_launch_warning()
+            .map(|warning| format!("Taskboard started. {warning}"))
+            .unwrap_or_else(|| "Taskboard started.".to_string());
+        taskboard_response("ok", message, false, true)
     } else {
         taskboard_response(
             "failed",

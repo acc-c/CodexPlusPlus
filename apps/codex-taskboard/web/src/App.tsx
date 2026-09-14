@@ -100,7 +100,7 @@ import { createRevisionPoller, getRevisionPollingInterval } from "./revisionPoll
 type ConnectionState = "connecting" | "live" | "reconnecting";
 type Theme = "light" | "dark";
 type BoardView = "issues" | "hierarchy" | "archive" | "workflow";
-const SHOW_WORKFLOW_BOARD_ENTRY = false;
+const SHOW_WORKFLOW_BOARD_ENTRY = true;
 const DEFAULT_PROJECT_ID = "local";
 const NO_PROJECT_NAME = "无项目";
 

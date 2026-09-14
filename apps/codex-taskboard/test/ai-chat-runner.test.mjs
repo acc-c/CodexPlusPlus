@@ -162,7 +162,17 @@ if (args[0] === "app-server") {
     async close() {
       await this.service.close();
       this.database.close();
-      await rm(directory, { recursive: true, force: true });
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        try {
+          await rm(directory, { recursive: true, force: true });
+          return;
+        } catch (error) {
+          if (!["EBUSY", "EPERM"].includes(error?.code) || attempt === 19) {
+            throw error;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+      }
     },
   };
 }
@@ -179,7 +189,13 @@ test("Codex turns use stdin, explicit resume ids, server-owned cwd and sanitized
       supportedReasoningEfforts: ["low", "medium", "high"],
       serviceTiers: [{ id: "priority", name: "Fast" }],
     }]);
-    assert.deepEqual(catalog.skills, [{ id: "real-skill", label: "Real Skill", scope: "repo" }]);
+    assert.deepEqual(catalog.skills, [{
+      id: "real-skill",
+      label: "Real Skill",
+      description: "",
+      path: "",
+      scope: "repo",
+    }]);
 
     const thread = await fixture.service.createThread({
       projectId: "project",
@@ -190,7 +206,7 @@ test("Codex turns use stdin, explicit resume ids, server-owned cwd and sanitized
     assert.equal(thread.origin.workspacePath, fixture.workspace);
 
     const first = await fixture.service.startTurn(thread.id, {
-      message: "HIDDEN_SENTINEL first",
+      message: "HIDDEN_SENTINEL \uFFFC first",
       skillIds: ["real-skill"],
     });
     await waitFor(() => fixture.service.getRun(first.id)?.status !== "running");
@@ -202,6 +218,8 @@ test("Codex turns use stdin, explicit resume ids, server-owned cwd and sanitized
       "exec", "--json", "--color", "never",
       "-C", fixture.workspace,
       "-s", "workspace-write",
+      "-c", 'approval_policy="on-request"',
+      "-c", 'approvals_reviewer="auto_review"',
       "--add-dir", fixture.otherWorkspace,
       "-m", "gpt-real",
       "-c", 'model_reasoning_effort="high"',
@@ -210,11 +228,13 @@ test("Codex turns use stdin, explicit resume ids, server-owned cwd and sanitized
     assert.equal(captures[0].args.join(" ").includes("HIDDEN_SENTINEL"), false);
     assert.match(captures[0].prompt, /\[\$manage-taskboard\]\(\/fixture\/manage-taskboard\/SKILL\.md\) e-taskboard/);
     assert.match(captures[0].prompt, /\$real-skill/);
-    assert.match(captures[0].prompt, /HIDDEN_SENTINEL first/);
+    assert.match(captures[0].prompt, /HIDDEN_SENTINEL \[\$real-skill\]\(\) first/);
     assert.deepEqual(captures[1].args, [
       "exec", "--json", "--color", "never",
       "-C", fixture.workspace,
       "-s", "workspace-write",
+      "-c", 'approval_policy="on-request"',
+      "-c", 'approvals_reviewer="auto_review"',
       "--add-dir", fixture.otherWorkspace,
       "-m", "gpt-real",
       "-c", 'model_reasoning_effort="high"',

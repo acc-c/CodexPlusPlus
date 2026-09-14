@@ -8,6 +8,7 @@ import { main } from "../cli/taskctl.mjs";
 import { createTaskboardServer } from "../server/index.mjs";
 
 const temporaryDirectories = [];
+const LAN_SHARED_SECRET = "test-taskboard-secret";
 
 test.afterEach(async () => {
   while (temporaryDirectories.length > 0) {
@@ -29,6 +30,10 @@ function jsonResponse(payload, status = 200) {
     status,
     headers: { "content-type": "application/json" },
   });
+}
+
+function assertPrivateMode(actual, expected) {
+  if (process.platform !== "win32") assert.equal(actual & 0o777, expected);
 }
 
 async function runCli(argv, overrides = {}) {
@@ -105,7 +110,7 @@ test("cloud config persists Basic Auth credentials and device mappings in a mode
       portfolio: "/Users/alice/Documents/portfolio",
     },
   });
-  assert.equal((await stat(configPath)).mode & 0o777, 0o600);
+  assertPrivateMode((await stat(configPath)).mode, 0o600);
   assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")), await store.read());
 });
 
@@ -520,6 +525,7 @@ test("configured server proxies business APIs without touching local rows and ad
       realtime: { transport: "poll", intervalMs: 2000 },
       localCapabilities: { available: true },
       manageTaskboardSkillPath: app.options.skillPath,
+      capabilities: { localAiChat: true },
     });
     const session = await fetch(`${baseUrl}/api/local/cloud-session`)
       .then((response) => response.json());
@@ -555,6 +561,7 @@ test("cloud mode exposes machine capabilities only to loopback while local mode 
   const app = createTaskboardServer({
     dataDirectory: directory,
     cloudConfigPath: configPath,
+    sharedSecret: LAN_SHARED_SECRET,
     remoteFetch: async () => {
       upstreamCalls += 1;
       return jsonResponse({ projects: [] });
@@ -562,6 +569,9 @@ test("cloud mode exposes machine capabilities only to loopback while local mode 
   });
   const address = await app.listen({ host: "0.0.0.0", port: 0 });
   const lanBaseUrl = `http://${lanAddress}:${address.port}`;
+  const lanHeaders = {
+    authorization: `Basic ${Buffer.from(`codex:${LAN_SHARED_SECRET}`).toString("base64")}`,
+  };
 
   try {
     for (const pathname of [
@@ -570,16 +580,16 @@ test("cloud mode exposes machine capabilities only to loopback while local mode 
       "/api/workflow-capabilities",
       "/api/projects/portfolio/development-contexts",
     ]) {
-      const response = await fetch(`${lanBaseUrl}${pathname}`);
+      const response = await fetch(`${lanBaseUrl}${pathname}`, { headers: lanHeaders });
       assert.equal(response.status, 403, pathname);
       assert.equal((await response.json()).error.code, "LOCAL_ONLY", pathname);
     }
-    const projectResponse = await fetch(`${lanBaseUrl}/api/projects`);
+    const projectResponse = await fetch(`${lanBaseUrl}/api/projects`, { headers: lanHeaders });
     assert.equal(projectResponse.status, 403);
     assert.equal((await projectResponse.json()).error.code, "LOCAL_ONLY");
     const taskResponse = await fetch(`${lanBaseUrl}/api/tasks`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { ...lanHeaders, "content-type": "application/json" },
       body: JSON.stringify({ projectId: "portfolio", title: "Must not proxy" }),
     });
     assert.equal(taskResponse.status, 403);
@@ -587,9 +597,9 @@ test("cloud mode exposes machine capabilities only to loopback while local mode 
     assert.equal(upstreamCalls, 0);
 
     await store.clearCloud();
-    const localResponse = await fetch(`${lanBaseUrl}/api/device-workspaces`);
+    const localResponse = await fetch(`${lanBaseUrl}/api/device-workspaces`, { headers: lanHeaders });
     assert.equal(localResponse.status, 200);
-    const localProjects = await fetch(`${lanBaseUrl}/api/projects`);
+    const localProjects = await fetch(`${lanBaseUrl}/api/projects`, { headers: lanHeaders });
     assert.equal(localProjects.status, 200);
   } finally {
     await app.close();
@@ -691,7 +701,7 @@ test("taskctl cloud status, logout, and project map use local companion endpoint
     ["http://127.0.0.1:49000/api/local/project-mappings/portfolio", "PUT"],
   ]);
   assert.deepEqual(JSON.parse(calls[2].init.body), {
-    workspacePath: "/work/portfolio",
+    workspacePath: path.resolve("/work", "portfolio"),
   });
 });
 

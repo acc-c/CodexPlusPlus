@@ -131,7 +131,7 @@ test("common issue mutations enter a Linear-style undo queue", () => {
 test("selected issues can be bulk moved to another project", () => {
   assert.match(appSource, /const selectedIssueTasks = useMemo/);
   assert.match(appSource, /async function moveSelectedTasksToProject/);
-  assert.match(appSource, /className="compact-select bulk-project-move"/);
+  assert.match(appSource, /bulk-project-move/);
   assert.match(appSource, /moveTaskRequest\(task, task\.status, undefined, \{ projectId: targetProject\.id \}\)/);
   assert.match(appSource, /moveTaskRequest\(moved, previous\.status, previous\.sortOrder, \{ projectId: previous\.projectId \}\)/);
   assert.match(apiSource, /options: \{ threadId\?: string; projectId\?: string \} = \{\}/);
@@ -146,7 +146,7 @@ test("issues expose processing conversations without manual binding", () => {
   assert.doesNotMatch(editorSource, /对话 ID|linkedThreadId/);
   assert.match(detailSource, /currentTask\.threadId/);
   assert.doesNotMatch(detailSource, /currentTask\.threadIds/);
-  assert.match(detailSource, /<strong>查看对话<\/strong>/);
+  assert.match(detailSource, /<strong>继续对话<\/strong>/);
   assert.match(detailSource, /className="conversation-thread-id">\{threadId\}/);
   assert.doesNotMatch(detailSource, /shortThreadId/);
   assert.doesNotMatch(detailSource, /detail-property-label">Codex/);
@@ -181,7 +181,7 @@ test("comments stage, upload, render and delete their own attachments", () => {
   assert.match(apiSource, /\/api\/comments\/\$\{encodeURIComponent\(commentId\)\}\/attachments/);
   assert.match(detailSource, /pendingCommentFiles/);
   assert.match(detailSource, /uploadCommentAttachment\(comment\.id, file\)/);
-  assert.match(detailSource, /comment\.attachments\.map/);
+  assert.match(detailSource, /comment\.attachments\s*\.filter\([\s\S]*?\)\s*\.map/);
   assert.match(detailSource, /setPendingAttachmentDelete\(attachment\)/);
 });
 

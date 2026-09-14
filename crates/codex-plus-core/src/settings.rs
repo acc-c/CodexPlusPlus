@@ -592,6 +592,10 @@ pub struct BackendSettings {
 
 impl Default for BackendSettings {
     fn default() -> Self {
+        let tools = [(ToolId::Codex, ToolConfig::default())]
+            .into_iter()
+            .collect();
+
         Self {
             codex_app_path: String::new(),
             codex_extra_args: Vec::new(),
@@ -666,7 +670,7 @@ impl Default for BackendSettings {
             aggregate_relay_profiles: Vec::new(),
             active_aggregate_relay_id: String::new(),
             relay_test_model: default_relay_test_model(),
-            tools: BTreeMap::new(),
+            tools,
             active_tool: ToolId::Codex,
         }
     }
@@ -1175,9 +1179,7 @@ impl SettingsStore {
         let contents = match fs::read_to_string(&self.path) {
             Ok(contents) => contents,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let mut settings = BackendSettings::default();
-                settings.sync_tool_shards();
-                return Ok(settings);
+                return Ok(BackendSettings::default());
             }
             Err(error) => {
                 return Err(error)
