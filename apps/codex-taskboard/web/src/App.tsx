@@ -50,21 +50,11 @@ import {
   assigneeTargetForActor,
 } from "./actors";
 import { BoardColumn, STATUS_DETAILS } from "./components/BoardColumn";
-import { AiChat } from "./components/AiChat";
-import { ArchivedIssues } from "./components/ArchivedIssues";
-import { BoardSettingsMenu } from "./components/BoardSettingsMenu";
-import { HiddenColumns } from "./components/HiddenColumns";
-import { IssueHierarchyView } from "./components/IssueHierarchyView";
 import {
   resolveInlineMediaMarkdown,
   type PendingInlineImage,
 } from "./components/InlineMediaComposer";
 import { LinearIcon } from "./components/LinearIcon";
-import { ProjectAutomationMenu } from "./components/ProjectAutomationMenu";
-import { TaskContextMenu } from "./components/TaskContextMenu";
-import { TaskDetail } from "./components/TaskDetail";
-import { TaskEditor } from "./components/TaskEditor";
-import { TaskFilterMenu } from "./components/TaskFilterMenu";
 import { buildIssueUrl, readIssueIdentifier } from "./issueRoute";
 import { DEFAULT_LABELS } from "./labels";
 import {
@@ -111,6 +101,36 @@ function projectDisplayName(project: { id: string; name: string } | null | undef
 
 const WorkflowBoard = lazy(() => import("./components/WorkflowBoard").then((module) => ({
   default: module.WorkflowBoard,
+})));
+const AiChat = lazy(() => import("./components/AiChat").then((module) => ({
+  default: module.AiChat,
+})));
+const ArchivedIssues = lazy(() => import("./components/ArchivedIssues").then((module) => ({
+  default: module.ArchivedIssues,
+})));
+const BoardSettingsMenu = lazy(() => import("./components/BoardSettingsMenu").then((module) => ({
+  default: module.BoardSettingsMenu,
+})));
+const HiddenColumns = lazy(() => import("./components/HiddenColumns").then((module) => ({
+  default: module.HiddenColumns,
+})));
+const IssueHierarchyView = lazy(() => import("./components/IssueHierarchyView").then((module) => ({
+  default: module.IssueHierarchyView,
+})));
+const ProjectAutomationMenu = lazy(() => import("./components/ProjectAutomationMenu").then((module) => ({
+  default: module.ProjectAutomationMenu,
+})));
+const TaskContextMenu = lazy(() => import("./components/TaskContextMenu").then((module) => ({
+  default: module.TaskContextMenu,
+})));
+const TaskDetail = lazy(() => import("./components/TaskDetail").then((module) => ({
+  default: module.TaskDetail,
+})));
+const TaskEditor = lazy(() => import("./components/TaskEditor").then((module) => ({
+  default: module.TaskEditor,
+})));
+const TaskFilterMenu = lazy(() => import("./components/TaskFilterMenu").then((module) => ({
+  default: module.TaskFilterMenu,
 })));
 
 interface EditorState {
@@ -2995,16 +3015,18 @@ export function App() {
 
           <div ref={dragRegionRef} className="workspace-drag-region" aria-hidden="true" />
 
-          <div className="header-actions">
+            <div className="header-actions">
             {selectedProjectId && (
-              <ProjectAutomationMenu
-                automation={selectedProjectAutomation}
-                pending={automationPending}
-                error={automationError}
-                unavailableReason={automationProjectContext.unavailableReason}
-                onOpen={() => void reconcileProjectAutomation()}
-                onChange={(options) => void saveProjectAutomation(options)}
-              />
+              <Suspense fallback={null}>
+                <ProjectAutomationMenu
+                  automation={selectedProjectAutomation}
+                  pending={automationPending}
+                  error={automationError}
+                  unavailableReason={automationProjectContext.unavailableReason}
+                  onOpen={() => void reconcileProjectAutomation()}
+                  onChange={(options) => void saveProjectAutomation(options)}
+                />
+              </Suspense>
             )}
             {selectedProjectId && (boardView === "issues" || boardView === "hierarchy") && (
               <button
@@ -3126,18 +3148,22 @@ export function App() {
               />
               {!search && <kbd>/</kbd>}
             </label>
-            <TaskFilterMenu
-              tasks={tasks}
-              search={search}
-              labels={availableLabels}
-              filters={filters}
-              onChange={setFilters}
-            />
-            {boardView === "issues" && (
-              <BoardSettingsMenu
-                showEmptyColumns={showEmptyColumns}
-                onShowEmptyColumnsChange={updateShowEmptyColumns}
+            <Suspense fallback={null}>
+              <TaskFilterMenu
+                tasks={tasks}
+                search={search}
+                labels={availableLabels}
+                filters={filters}
+                onChange={setFilters}
               />
+            </Suspense>
+            {boardView === "issues" && (
+              <Suspense fallback={null}>
+                <BoardSettingsMenu
+                  showEmptyColumns={showEmptyColumns}
+                  onShowEmptyColumnsChange={updateShowEmptyColumns}
+                />
+              </Suspense>
             )}
             {(search || activeFilterCount > 0) && (
               <button
@@ -3337,35 +3363,37 @@ export function App() {
             )}
           </section>
         ) : detailTask && selectedProject ? (
-          <TaskDetail
-            key={detailTask.id}
-            task={detailTask}
-            tasks={tasks}
-            currentUser={currentUser}
-            availableLabels={availableLabels}
-            workflows={workflowOptions}
-            developmentScan={developmentScan}
-            developmentScanLoading={developmentScanLoading}
-            commentsRevision={commentsRevision}
-            attachmentsRevision={attachmentsRevision}
-            onUpdate={(current, changes) => updateTaskProperties(current, changes)}
-            onArchive={archiveTask}
-            onRestore={restoreArchivedTask}
-            onDelete={deleteTask}
-            onOpenTask={openTaskDetail}
-            onAddRelation={(current, type, relatedTaskId) => (
-              mutateTaskRelation("add", current, type, relatedTaskId)
-            )}
-            onRemoveRelation={(current, type, relatedTaskId) => (
-              mutateTaskRelation("remove", current, type, relatedTaskId)
-            )}
-            onContinueThread={continueThreadInPanel}
-            onOpenThread={openThread}
-            onOpenInThread={openTaskInThread}
-            openingThread={openingThreadTaskId === detailTask.id}
-            onError={setActionError}
-            onAnnounce={setAnnouncement}
-          />
+          <Suspense fallback={<div className="loading-board archive-loading" aria-label="正在打开任务" aria-busy="true" />}>
+            <TaskDetail
+              key={detailTask.id}
+              task={detailTask}
+              tasks={tasks}
+              currentUser={currentUser}
+              availableLabels={availableLabels}
+              workflows={workflowOptions}
+              developmentScan={developmentScan}
+              developmentScanLoading={developmentScanLoading}
+              commentsRevision={commentsRevision}
+              attachmentsRevision={attachmentsRevision}
+              onUpdate={(current, changes) => updateTaskProperties(current, changes)}
+              onArchive={archiveTask}
+              onRestore={restoreArchivedTask}
+              onDelete={deleteTask}
+              onOpenTask={openTaskDetail}
+              onAddRelation={(current, type, relatedTaskId) => (
+                mutateTaskRelation("add", current, type, relatedTaskId)
+              )}
+              onRemoveRelation={(current, type, relatedTaskId) => (
+                mutateTaskRelation("remove", current, type, relatedTaskId)
+              )}
+              onContinueThread={continueThreadInPanel}
+              onOpenThread={openThread}
+              onOpenInThread={openTaskInThread}
+              openingThread={openingThreadTaskId === detailTask.id}
+              onError={setActionError}
+              onAnnounce={setAnnouncement}
+            />
+          </Suspense>
         ) : boardView === "archive" ? (
           tasksLoading && !hasLoadedTasks ? (
             <div className="loading-board archive-loading" aria-label="正在加载归档任务" aria-busy="true">
@@ -3376,17 +3404,19 @@ export function App() {
               ))}
             </div>
           ) : (
-            <ArchivedIssues
-              tasks={filteredTasks}
-              totalTasks={tasks.length}
-              hasQuery={Boolean(search || activeFilterCount > 0)}
-              restoringTaskId={restoringArchivedTaskId}
-              deletingTaskId={deletingArchivedTask ? pendingArchivedDeleteTask?.id ?? null : null}
-              onClearQuery={() => { setSearch(""); setFilters(EMPTY_TASK_FILTERS); }}
-              onOpenTask={openTaskDetail}
-              onRestore={(task) => void restoreArchivedTask(task)}
-              onRequestDelete={setPendingArchivedDeleteTask}
-            />
+            <Suspense fallback={<div className="loading-board archive-loading" aria-label="正在打开归档任务" aria-busy="true" />}>
+              <ArchivedIssues
+                tasks={filteredTasks}
+                totalTasks={tasks.length}
+                hasQuery={Boolean(search || activeFilterCount > 0)}
+                restoringTaskId={restoringArchivedTaskId}
+                deletingTaskId={deletingArchivedTask ? pendingArchivedDeleteTask?.id ?? null : null}
+                onClearQuery={() => { setSearch(""); setFilters(EMPTY_TASK_FILTERS); }}
+                onOpenTask={openTaskDetail}
+                onRestore={(task) => void restoreArchivedTask(task)}
+                onRequestDelete={setPendingArchivedDeleteTask}
+              />
+            </Suspense>
           )
         ) : boardView === "hierarchy" ? (
           tasksLoading && !hasLoadedTasks ? (
@@ -3398,15 +3428,17 @@ export function App() {
               ))}
             </div>
           ) : (
-            <IssueHierarchyView
-              tasks={filteredTasks}
-              allTasks={tasks}
-              totalTasks={tasks.length}
-              hasQuery={Boolean(search || activeFilterCount > 0)}
-              onClearQuery={() => { setSearch(""); setFilters(EMPTY_TASK_FILTERS); }}
-              onOpenTask={openTaskDetail}
-              onOpenThread={openThread}
-            />
+            <Suspense fallback={<div className="loading-board archive-loading" aria-label="正在打开层级视图" aria-busy="true" />}>
+              <IssueHierarchyView
+                tasks={filteredTasks}
+                allTasks={tasks}
+                totalTasks={tasks.length}
+                hasQuery={Boolean(search || activeFilterCount > 0)}
+                onClearQuery={() => { setSearch(""); setFilters(EMPTY_TASK_FILTERS); }}
+                onOpenTask={openTaskDetail}
+                onOpenThread={openThread}
+              />
+            </Suspense>
           )
         ) : boardView === "workflow" ? (
           <Suspense fallback={<div className="workflow-board-loading">正在打开节点模式…</div>}>
@@ -3496,16 +3528,18 @@ export function App() {
                 />
               ))}
               {hiddenStatuses.length > 0 && (
-                <HiddenColumns
-                  statuses={hiddenStatuses}
-                  counts={Object.fromEntries(
-                    TASK_STATUSES.map((status) => [status, tasksByStatus[status].length]),
-                  ) as Record<TaskStatus, number>}
-                  dropTarget={dropTarget}
-                  onDragTargetChange={setDropTarget}
-                  onDrop={(destination, taskId) => finishTaskDrop(destination, taskId)}
-                  onShow={(shownStatus) => updateColumnVisibility(shownStatus, true)}
-                />
+                <Suspense fallback={null}>
+                  <HiddenColumns
+                    statuses={hiddenStatuses}
+                    counts={Object.fromEntries(
+                      TASK_STATUSES.map((status) => [status, tasksByStatus[status].length]),
+                    ) as Record<TaskStatus, number>}
+                    dropTarget={dropTarget}
+                    onDragTargetChange={setDropTarget}
+                    onDrop={(destination, taskId) => finishTaskDrop(destination, taskId)}
+                    onShow={(shownStatus) => updateColumnVisibility(shownStatus, true)}
+                  />
+                </Suspense>
               )}
             </div>
             {selectionBox && (
@@ -3520,43 +3554,47 @@ export function App() {
       </main>
 
       {editor && (
-        <TaskEditor
-          key={editor.task?.id ?? `new-${editor.projectId ?? selectedProjectId}-${editor.status}`}
-          task={editor.task}
-          initialStatus={editor.status}
-          labels={availableLabels}
-          workflows={workflowOptions}
-          currentUser={currentUser}
-          developmentScan={developmentScan}
-          developmentScanLoading={developmentScanLoading}
-          onCancel={() => setEditor(null)}
-          onSave={saveEditor}
-        />
+        <Suspense fallback={null}>
+          <TaskEditor
+            key={editor.task?.id ?? `new-${editor.projectId ?? selectedProjectId}-${editor.status}`}
+            task={editor.task}
+            initialStatus={editor.status}
+            labels={availableLabels}
+            workflows={workflowOptions}
+            currentUser={currentUser}
+            developmentScan={developmentScan}
+            developmentScanLoading={developmentScanLoading}
+            onCancel={() => setEditor(null)}
+            onSave={saveEditor}
+          />
+        </Suspense>
       )}
 
       {contextMenu && contextMenuTask && (
-        <TaskContextMenu
-          task={contextMenuTask}
-          position={{ x: contextMenu.x, y: contextMenu.y }}
-          labels={availableLabels}
-          onClose={closeContextMenu}
-          onEdit={openTaskDetail}
-          onStatusChange={(task, status) => void moveTask(task, status)}
-          onPriorityChange={(task, nextPriority) => void updateTaskProperties(
-            task,
-            { priority: nextPriority },
-            `${task.identifier} 优先级已更新。`,
-          ).catch(() => {})}
-          onLabelsChange={(task, labels) => void updateTaskProperties(
-            task,
-            { labels },
-            `${task.identifier} 标签已更新。`,
-          ).catch(() => {})}
-          onDuplicate={(task) => void duplicateTask(task)}
-          onCopy={(text, message) => void copyText(text, message)}
-          onOpenInThread={openTaskInThread}
-          onArchive={(task) => void archiveTask(task)}
-        />
+        <Suspense fallback={null}>
+          <TaskContextMenu
+            task={contextMenuTask}
+            position={{ x: contextMenu.x, y: contextMenu.y }}
+            labels={availableLabels}
+            onClose={closeContextMenu}
+            onEdit={openTaskDetail}
+            onStatusChange={(task, status) => void moveTask(task, status)}
+            onPriorityChange={(task, nextPriority) => void updateTaskProperties(
+              task,
+              { priority: nextPriority },
+              `${task.identifier} 优先级已更新。`,
+            ).catch(() => {})}
+            onLabelsChange={(task, labels) => void updateTaskProperties(
+              task,
+              { labels },
+              `${task.identifier} 标签已更新。`,
+            ).catch(() => {})}
+            onDuplicate={(task) => void duplicateTask(task)}
+            onCopy={(text, message) => void copyText(text, message)}
+            onOpenInThread={openTaskInThread}
+            onArchive={(task) => void archiveTask(task)}
+          />
+        </Suspense>
       )}
 
       {pendingArchivedDeleteTask && (
@@ -3590,11 +3628,13 @@ export function App() {
       )}
 
       {!embedded && (
-        <AiChat
-          available={localAiChatAvailable}
-          projectId={selectedProjectId || null}
-          issueId={detailTaskId}
-        />
+        <Suspense fallback={null}>
+          <AiChat
+            available={localAiChatAvailable}
+            projectId={selectedProjectId || null}
+            issueId={detailTaskId}
+          />
+        </Suspense>
       )}
 
       <div className="sr-only" role="status" aria-live="polite">{announcement}</div>
