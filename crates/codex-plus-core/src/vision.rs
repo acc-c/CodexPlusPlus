@@ -2846,15 +2846,14 @@ mod tests {
         assert!(outcome.http_code.is_none());
     }
 
-    /// 连接错误（非超时）→ send_error。
-    /// 用端口 0：Windows 安全软件可能让「连接被拒」延迟 ~2s 才返回，恰好撞上
-    /// cfg(test) 的 2s 请求超时而被误判为 timeout；连接端口 0 则立即报
-    /// 传输层错误（WSAEADDRNOTAVAIL），确定性地走 send_error 路径。
+    /// 传输错误（非超时）→ send_error。
+    /// 不走真实网络端口：Windows 上拒绝连接有时会拖到 cfg(test) 的 2s 超时，
+    /// 用非法 URL 稳定触发 reqwest 的 builder/send 错误。
     #[tokio::test]
-    async fn test_vlm_once_send_error_on_connection_refused() {
+    async fn test_vlm_once_send_error_on_invalid_endpoint() {
         let client = reqwest::Client::new();
         let outcome = test_vlm_once(
-            &test_vlm_config("http://127.0.0.1:0".to_string()),
+            &test_vlm_config("http://%".to_string()),
             "data:image/png;base64,QUJD",
             &client,
         )
