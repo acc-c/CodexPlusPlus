@@ -27,7 +27,7 @@ pub fn ensure_safe_recursive_removal(target: &Path, codex_home: &Path) -> anyhow
     let target = normalize_for_comparison(target);
     let home = normalize_for_comparison(codex_home);
 
-    if target.as_os_str().is_empty() || target == Path::new("/") {
+    if target.as_os_str().is_empty() || is_filesystem_root(&target) {
         anyhow::bail!("拒绝删除文件系统根目录：{}", target.display());
     }
     if target == home {
@@ -44,6 +44,18 @@ pub fn ensure_safe_recursive_removal(target: &Path, codex_home: &Path) -> anyhow
         );
     }
     Ok(())
+}
+
+fn is_filesystem_root(path: &Path) -> bool {
+    let mut saw_root = false;
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(_) => {}
+            std::path::Component::RootDir => saw_root = true,
+            _ => return false,
+        }
+    }
+    saw_root
 }
 
 /// 规范化到可比较的形态。

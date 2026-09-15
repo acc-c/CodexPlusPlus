@@ -4,7 +4,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use codex_plus_core::install::SILENT_BINARY;
 use codex_plus_core::models::{DeleteResult, SessionRef};
@@ -14,6 +14,10 @@ use codex_plus_core::settings::{
     BackendSettings, RelayProfile, RelaySessionProvider, SettingsStore,
 };
 use codex_plus_core::status::{LaunchStatus, StatusStore};
+use codex_plus_core::taskboard_runtime::{
+    TASKBOARD_URL, spawn_taskboard_service, taskboard_health_ok, taskboard_launch_warning,
+    wait_for_taskboard_health,
+};
 use codex_plus_core::user_scripts::UserScriptManager;
 use codex_plus_core::zed_remote::{ZedOpenStrategy, ZedRemoteProject};
 use serde::Serialize;
@@ -54,6 +58,14 @@ pub struct OverviewPayload {
     pub update_status: String,
     pub settings_path: String,
     pub logs_path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskboardPayload {
+    pub url: String,
+    pub already_running: bool,
+    pub launched: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -841,6 +853,7 @@ pub fn restart_codex_plus(request: LaunchRequest) -> CommandResult<Value> {
         );
     }
     codex_plus_core::watcher::stop_launcher_processes_and_wait();
+    #[cfg(target_os = "macos")]
     codex_plus_core::watcher::stop_codex_processes_for_debug_port_and_wait(request.debug_port);
     let home = codex_plus_core::relay_config::default_codex_home_dir();
     let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
@@ -1167,6 +1180,43 @@ fn spawn_silent_launcher(request: &LaunchRequest) -> anyhow::Result<()> {
     args.push("--helper-port".to_string());
     args.push(request.helper_port.to_string());
     codex_plus_core::install::spawn_companion(SILENT_BINARY, &args).map(|_| ())
+}
+
+#[tauri::command]
+pub fn ensure_taskboard_service() -> CommandResult<TaskboardPayload> {
+    if taskboard_health_ok() {
+        return ok(
+            "Taskboard is already running.",
+            taskboard_payload(true, false),
+        );
+    }
+
+    if let Err(error) = spawn_taskboard_service() {
+        return failed(
+            &format!("Failed to start Taskboard with codex-taskboard: {error}"),
+            taskboard_payload(false, false),
+        );
+    }
+
+    if wait_for_taskboard_health(Duration::from_secs(8)) {
+        let message = taskboard_launch_warning()
+            .map(|warning| format!("Taskboard started. {warning}"))
+            .unwrap_or_else(|| "Taskboard started.".to_string());
+        ok(&message, taskboard_payload(false, true))
+    } else {
+        failed(
+            "Started codex-taskboard, but http://127.0.0.1:47823/health is still unavailable.",
+            taskboard_payload(false, true),
+        )
+    }
+}
+
+fn taskboard_payload(already_running: bool, launched: bool) -> TaskboardPayload {
+    TaskboardPayload {
+        url: TASKBOARD_URL.to_string(),
+        already_running,
+        launched,
+    }
 }
 
 pub fn start_weixin_connect_from_saved_settings() {
@@ -7505,7 +7555,6 @@ enabled = true
         );
     }
 
-    #[test]
     /// #1972：用户误把 Codex++ 自己的 exe 选成了「Codex 应用路径」——文件选择器
     /// 只按 exe 扩展名过滤，拦不住。以前无效路径会原样存进 settings.json，而
     /// launcher 拿到显式无效 --app-path 又不回退自动探测，于是启动永久失败，
